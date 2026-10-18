@@ -888,6 +888,39 @@ inline rocm_threadpool& sycl::queue::get_or_create_rocm_pool() const {
 
 namespace sycl {
 
+inline void handler::wait_for_prior_commands() {
+    wait_for_dependencies();
+}
+
+inline int handler::paras_activate_native_device() {
+#if (PARAS_CUDA_BACKEND)
+    if (gpu_pool_ == nullptr || !gpu_pool_->get_device().is_gpu()) return -1;
+    int previous = -1;
+    if (cudaGetDevice(&previous) != cudaSuccess) previous = -1;
+    const cudaError_t err = cudaSetDevice(gpu_pool_->get_device().get_native_id());
+    if (err != cudaSuccess) throw sycl::exception(cudaGetErrorString(err));
+    return previous;
+#elif (PARAS_HIP_BACKEND)
+    if (rocm_pool_ == nullptr || !rocm_pool_->get_device().is_gpu()) return -1;
+    int previous = -1;
+    if (hipGetDevice(&previous) != hipSuccess) previous = -1;
+    const hipError_t err = hipSetDevice(rocm_pool_->get_device().get_native_id());
+    if (err != hipSuccess) throw sycl::exception(hipGetErrorString(err));
+    return previous;
+#else
+    return -1;
+#endif
+}
+
+inline void handler::paras_restore_native_device(int previous) noexcept {
+    if (previous < 0) return;
+#if (PARAS_CUDA_BACKEND)
+    (void)cudaSetDevice(previous);
+#elif (PARAS_HIP_BACKEND)
+    (void)hipSetDevice(previous);
+#endif
+}
+
 inline void handler::memset(void* ptr, int value, size_t num_bytes) {
 #if PARAS_CUDA_BACKEND
     if (gpu_pool_ == nullptr) {

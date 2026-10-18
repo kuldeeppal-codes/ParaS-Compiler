@@ -103,7 +103,13 @@ public:
     >*/
     template <typename FunctorT>
     void host_task(FunctorT&& hostFunction) {
-        hostFunction();
+        wait_for_prior_commands();
+        if constexpr (std::is_invocable_v<FunctorT&, interop_handle>) {
+            const native_device_scope scope(*this);
+            hostFunction(host_task_interop_handle());
+        } else {
+            hostFunction();
+        }
     }
 
     /** SYCL-CTS integration: require(accessor), required by
@@ -266,6 +272,19 @@ public:
 
     void wait_for_dependencies() const { sycl::event::wait(deps_); }
 
+    void wait_for_prior_commands();
+
+    int paras_activate_native_device();
+    static void paras_restore_native_device(int previous) noexcept;
+
+    struct native_device_scope {
+        explicit native_device_scope(handler& h) : previous(h.paras_activate_native_device()) {}
+        ~native_device_scope() { paras_restore_native_device(previous); }
+        native_device_scope(const native_device_scope&) = delete;
+        native_device_scope& operator=(const native_device_scope&) = delete;
+        int previous;
+    };
+
     template <typename injectCustomFunc>
     void parasSYCL_enqueue_custom_operation(injectCustomFunc&& cgf) {
 #if (PARAS_CUDA_BACKEND)
@@ -278,6 +297,7 @@ public:
         interop_handle ih(static_cast<void*>(gpu_pool_), sycl::backend::cuda);
 
         try {
+            const native_device_scope scope(*this);
             cgf(ih);
             async_mode_ = false;
         } catch (...) {
@@ -295,6 +315,7 @@ public:
         interop_handle ih(static_cast<void*>(rocm_pool_), sycl::backend::hip);
 
         try {
+            const native_device_scope scope(*this);
             cgf(ih);
             async_mode_ = false;
         } catch (...) {
@@ -339,6 +360,21 @@ public:
     void prefetch(const void*, std::size_t, Ignored&&...) {}
 
 private:
+    interop_handle host_task_interop_handle() {
+#if (PARAS_CUDA_BACKEND)
+        if (gpu_pool_ != nullptr) {
+            wait_for_dependencies();
+            return interop_handle(static_cast<void*>(gpu_pool_), sycl::backend::cuda);
+        }
+#elif (PARAS_HIP_BACKEND)
+        if (rocm_pool_ != nullptr) {
+            wait_for_dependencies();
+            return interop_handle(static_cast<void*>(rocm_pool_), sycl::backend::hip);
+        }
+#endif
+        return interop_handle(static_cast<void*>(pool_), sycl::backend::host);
+    }
+
     template <typename T, typename BinaryOperation>
     void paras_reduction_prepare(const reduction_impl<T, BinaryOperation>& red) {
         if (red.initialize_to_identity_) {

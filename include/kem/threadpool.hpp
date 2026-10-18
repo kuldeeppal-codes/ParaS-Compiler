@@ -249,6 +249,13 @@ void handler::parallel_for(const nd_range<dim>& r, Func f) {
     }
 }
 
+inline void handler::wait_for_prior_commands() {
+    wait_for_dependencies();
+}
+
+inline int handler::paras_activate_native_device() { return -1; }
+inline void handler::paras_restore_native_device(int) noexcept {}
+
 inline void handler::memset(void* ptr, int value, size_t num_bytes) {
     std::memset(ptr, value, num_bytes);
 }
