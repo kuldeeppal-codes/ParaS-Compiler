@@ -130,10 +130,10 @@ static inline std::vector<std::string> split_csv_4(const std::string& ln) {
 }
 
 static inline std::vector<std::size_t>
-get_visible_nvidia_indices(const std::size_t physicalDeviceCount) {
+get_visible_indices(const char* envName, const std::size_t physicalDeviceCount) {
     std::vector<std::size_t> indices;
 
-    const char* env = std::getenv("CUDA_VISIBLE_DEVICES");
+    const char* env = std::getenv(envName);
 
     if (env == nullptr) {
         for (std::size_t i = 0; i < physicalDeviceCount; ++i) {
@@ -173,6 +173,26 @@ get_visible_nvidia_indices(const std::size_t physicalDeviceCount) {
         start = end + 1;
     }
 
+    return indices;
+}
+
+static inline std::vector<std::size_t>
+get_visible_nvidia_indices(const std::size_t physicalDeviceCount) {
+    return get_visible_indices("CUDA_VISIBLE_DEVICES", physicalDeviceCount);
+}
+
+static inline std::vector<std::size_t>
+get_visible_amd_indices(const std::size_t physicalDeviceCount) {
+    const auto rocr = get_visible_indices("ROCR_VISIBLE_DEVICES", physicalDeviceCount);
+    const char* hipEnv = std::getenv("HIP_VISIBLE_DEVICES") ? "HIP_VISIBLE_DEVICES"
+                                                            : "CUDA_VISIBLE_DEVICES";
+    const auto hip = get_visible_indices(hipEnv, rocr.size());
+
+    std::vector<std::size_t> indices;
+    indices.reserve(hip.size());
+    for (const std::size_t i : hip) {
+        indices.push_back(rocr[i]);
+    }
     return indices;
 }
 
@@ -357,7 +377,10 @@ std::vector<sycl::device> detect_amd_gpus() {
     const std::string drv = rocm_driver_version_clean();
     const std::string rel = rocm_release_version();
 
-    for (const auto& g : gpus) {
+    const auto visibleIndices = get_visible_amd_indices(gpus.size());
+
+    for (std::size_t logicalId = 0; logicalId < visibleIndices.size(); ++logicalId) {
+        const auto& g = gpus[visibleIndices[logicalId]];
         std::string name = g.name.empty() ? "AMD GPU" : g.name;
 
         std::string version = "ROCm";
@@ -374,7 +397,8 @@ std::vector<sycl::device> detect_amd_gpus() {
 
         out.emplace_back(::paras_extension::device_ctor_tag{}, name, "AMD",
                          drv.empty() ? "unknown" : drv, version, cus, 1024, mem_bytes,
-                         sycl::info::local_mem_type::local, false, true, false, g.idx, false);
+                         sycl::info::local_mem_type::local, false, true, false,
+                         static_cast<int>(logicalId), false);
     }
 #endif
 
