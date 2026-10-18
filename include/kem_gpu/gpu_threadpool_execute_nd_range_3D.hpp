@@ -276,7 +276,7 @@ void rocm_threadpool::gpu_execute_nd_range_3D(const sycl::nd_range<3>& r, Func f
 
     const sycl::range<3> launchedGroupRange(groups0, groups1, groups2);
 
-    err = hipStreamSynchronize(stream);
+    err = async_launch() ? hipSuccess : hipStreamSynchronize(stream);
     if (err != hipSuccess) {
         throw sycl::exception(sycl::make_error_code(sycl::errc::runtime),
                               std::string("HIP failure before 3D kernel launch: ") +
@@ -294,7 +294,7 @@ void rocm_threadpool::gpu_execute_nd_range_3D(const sycl::nd_range<3>& r, Func f
                               std::string("3D kernel launch failed: ") + hipGetErrorString(err));
     }
 
-    err = hipStreamSynchronize(stream);
+    err = async_launch() ? hipSuccess : hipStreamSynchronize(stream);
     if (err != hipSuccess) {
         throw sycl::exception(sycl::make_error_code(sycl::errc::runtime),
                               std::string("3D kernel execution failed: ") + hipGetErrorString(err));

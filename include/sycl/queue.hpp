@@ -94,6 +94,7 @@ public:
 #elif (PARAS_HIP_BACKEND)
             handler h(get_or_create_rocm_pool());
             cgf(h);
+            return paras_submit_event();
 #endif
         } else {
             handler h;
@@ -138,6 +139,8 @@ public:
     event fill(T* ptr, const T& pattern, std::size_t count, const std::vector<event>&) {
         return fill(ptr, pattern, count);
     }
+
+    event paras_submit_event() const;
 
     void wait() const;
 

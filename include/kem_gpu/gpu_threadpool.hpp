@@ -556,7 +556,8 @@ public:
     rocm_threadpool(rocm_threadpool&& other) noexcept
         : stream(other.stream), ownsStream(other.ownsStream), dev_(std::move(other.dev_)),
           ctx_(std::move(other.ctx_)), props_(std::move(other.props_)),
-          queue_(std::move(other.queue_)), id_(other.id_) {
+          queue_(std::move(other.queue_)), id_(other.id_),
+          stream_alive_(std::move(other.stream_alive_)) {
         other.stream = nullptr;
         other.ownsStream = false;
     }
@@ -570,6 +571,7 @@ public:
 
         stream = other.stream;
         ownsStream = other.ownsStream;
+        stream_alive_ = std::move(other.stream_alive_);
         dev_ = std::move(other.dev_);
         ctx_ = std::move(other.ctx_);
         props_ = std::move(other.props_);
@@ -586,10 +588,34 @@ public:
         return props_.has_profiling() ? sycl::paras_now_ns() : 0;
     }
     sycl::event paras_finish_event(std::uint64_t t0) const {
+        if (async_launch()) {
+            hipStream_t s = stream;
+            std::shared_ptr<bool> alive = stream_alive_;
+            return sycl::event::paras_async(
+                sycl::backend::hip,
+                [s, alive] {
+                    if (!(alive && *alive)) return;
+                    const hipError_t err = hipStreamSynchronize(s);
+                    if (err != hipSuccess)
+                        throw sycl::exception(std::string("kernel execution failed: ") +
+                                              hipGetErrorString(err));
+                },
+                [s, alive] { return !(alive && *alive) || hipStreamQuery(s) == hipSuccess; });
+        }
         if (!props_.has_profiling()) {
             return sycl::event{};
         }
         return sycl::event::paras_profiled(t0, t0, sycl::paras_now_ns());
+    }
+
+    bool async_launch() const { return async_launch_ && !props_.has_profiling(); }
+
+    const hipDeviceProp_t& device_props() {
+        if (!device_props_valid_) {
+            paras_rocm_detail_check_props(hipGetDeviceProperties(&device_props_, dev_.get_native_id()));
+            device_props_valid_ = true;
+        }
+        return device_props_;
     }
     bool is_in_order() const { return props_.has_in_order(); }
     const void* paras_identity() const noexcept { return id_.get(); }
@@ -719,6 +745,10 @@ public:
                                      hipGetErrorString(err));
         }
 
+        if (stream_ordered_copy(dest, src)) {
+            return paras_finish_event(paras_t0);
+        }
+
         err = hipStreamSynchronize(stream);
         if (err != hipSuccess) {
             throw std::runtime_error(std::string("hipStreamSynchronize after memcpy failed: ") +
@@ -738,6 +768,10 @@ public:
 
         if (err != hipSuccess) {
             throw sycl::exception(hipGetErrorString(err));
+        }
+
+        if (stream_ordered_copy(dest, src)) {
+            return paras_finish_event(paras_t0);
         }
 
         err = hipStreamSynchronize(stream);
@@ -760,6 +794,10 @@ public:
                                      hipGetErrorString(err));
         }
 
+        if (async_launch()) {
+            return paras_finish_event(paras_t0);
+        }
+
         err = hipStreamSynchronize(stream);
         if (err != hipSuccess) {
             throw std::runtime_error(std::string("hipStreamSynchronize after memset failed: ") +
@@ -771,12 +809,38 @@ public:
 
     ~rocm_threadpool() noexcept { release_stream_noexcept(); }
 
+    bool stream_ordered_copy(void* dest, const void* src) const {
+        if (!async_launch()) return false;
+        return is_device_pointer(dest) && is_device_pointer(src);
+    }
+
+    static bool is_device_pointer(const void* p) {
+        hipPointerAttribute_t attr{};
+        if (hipPointerGetAttributes(&attr, p) != hipSuccess) {
+            (void)hipGetLastError();
+            return false;
+        }
+        return attr.type == hipMemoryTypeDevice;
+    }
+
 private:
     sycl::device dev_;
     sycl::context ctx_{dev_};
     sycl::property_list props_;
     sycl::queue queue_;
     std::shared_ptr<int> id_{std::make_shared<int>()};
+    std::shared_ptr<bool> stream_alive_;
+    hipDeviceProp_t device_props_{};
+    bool device_props_valid_ = false;
+    static void paras_rocm_detail_check_props(hipError_t err) {
+        if (err != hipSuccess)
+            throw sycl::exception(std::string("hipGetDeviceProperties failed: ") +
+                                  hipGetErrorString(err));
+    }
+    bool async_launch_ = [] {
+        const char* env = std::getenv("PARAS_ASYNC_KERNELS");
+        return env != nullptr && std::string(env) == "1";
+    }();
 
     void initialize_stream_for_device() {
         stream = nullptr;
@@ -822,6 +886,7 @@ private:
             ownsStream = false;
             throw sycl::exception(hipGetErrorString(err));
         }
+        stream_alive_ = std::make_shared<bool>(true);
     }
 
     void release_stream_noexcept() noexcept {
@@ -845,6 +910,7 @@ private:
                       << hipGetErrorString(syncErr) << '\n';
         }
 
+        if (stream_alive_) *stream_alive_ = false;
         hipError_t err = hipStreamDestroy(stream);
         if (err != hipSuccess) {
             std::cerr << "hipStreamDestroy failed: " << hipGetErrorString(err) << '\n';
@@ -876,6 +942,14 @@ inline rocm_threadpool& sycl::queue::get_or_create_rocm_pool() const {
     return *rocm_pool_;
 }
 
+inline sycl::event sycl::queue::paras_submit_event() const {
+    rocm_threadpool& pool = get_or_create_rocm_pool();
+    if (pool.async_launch()) {
+        return pool.paras_finish_event(0);
+    }
+    return event{get_backend()};
+}
+
 #endif
 
 #include "kem_gpu/gpu_threadpool_execute_1D.hpp"
@@ -890,6 +964,11 @@ namespace sycl {
 
 inline void handler::wait_for_prior_commands() {
     wait_for_dependencies();
+#if (PARAS_HIP_BACKEND)
+    if (rocm_pool_ != nullptr && rocm_pool_->async_launch()) {
+        rocm_pool_->wait();
+    }
+#endif
 }
 
 inline int handler::paras_activate_native_device() {

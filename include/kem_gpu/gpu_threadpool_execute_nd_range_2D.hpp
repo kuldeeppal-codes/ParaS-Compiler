@@ -122,9 +122,7 @@ void rocm_threadpool::gpu_execute_nd_range_2D(const sycl::nd_range<2>& r, Func f
     paras_rocm_detail::check(hipSetDevice(dev_.get_native_id()),
                              "hipSetDevice before 2D nd_range kernel");
 
-    hipDeviceProp_t props{};
-    paras_rocm_detail::check(hipGetDeviceProperties(&props, dev_.get_native_id()),
-                             "hipGetDeviceProperties for 2D nd_range");
+    const hipDeviceProp_t& props = device_props();
     if (sharedMemoryBytes > static_cast<std::size_t>(props.sharedMemPerBlock)) {
         throw sycl::exception(sycl::make_error_code(sycl::errc::memory_allocation),
                               "2D local_accessor allocation exceeds HIP shared memory per block");
@@ -148,7 +146,9 @@ void rocm_threadpool::gpu_execute_nd_range_2D(const sycl::nd_range<2>& r, Func f
         global0, global1, globalRange, localRange, launchedGroupRange, f);
 
     paras_rocm_detail::check(hipGetLastError(), "2D nd_range kernel launch failed");
-    paras_rocm_detail::check(hipStreamSynchronize(stream), "2D nd_range kernel execution failed");
+    if (!async_launch()) {
+        paras_rocm_detail::check(hipStreamSynchronize(stream), "2D nd_range kernel execution failed");
+    }
 }
 
 #endif /** End of PARAS_CUDA_BACKEND / PARAS_HIP_BACKEND */

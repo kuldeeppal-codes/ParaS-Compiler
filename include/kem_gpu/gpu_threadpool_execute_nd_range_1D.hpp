@@ -143,10 +143,7 @@ void rocm_threadpool::gpu_execute_nd_range_1D(const sycl::nd_range<1>& r, Func f
     paras_rocm_detail::check(hipSetDevice(dev_.get_native_id()),
                              "hipSetDevice before 1D nd_range kernel");
 
-    hipDeviceProp_t props{};
-
-    paras_rocm_detail::check(hipGetDeviceProperties(&props, dev_.get_native_id()),
-                             "hipGetDeviceProperties for 1D nd_range");
+    const hipDeviceProp_t& props = device_props();
 
     if (localSize > static_cast<std::size_t>(props.maxThreadsPerBlock)) {
         throw sycl::exception(sycl::make_error_code(sycl::errc::nd_range),
@@ -172,7 +169,9 @@ void rocm_threadpool::gpu_execute_nd_range_1D(const sycl::nd_range<1>& r, Func f
 
     paras_rocm_detail::check(hipGetLastError(), "1D nd_range kernel launch failed");
 
-    paras_rocm_detail::check(hipStreamSynchronize(stream), "1D nd_range kernel execution failed");
+    if (!async_launch()) {
+        paras_rocm_detail::check(hipStreamSynchronize(stream), "1D nd_range kernel execution failed");
+    }
 }
 
 #endif /** End of PARAS_CUDA_BACKEND || PARAS_HIP_BACKEND */

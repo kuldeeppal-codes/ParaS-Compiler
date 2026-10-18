@@ -21,6 +21,7 @@
 #ifndef SYCL_EVENT_HPP
 #define SYCL_EVENT_HPP
 
+#include <functional>
 #include <vector>
 #include <memory>
 #include <stdexcept>
@@ -36,6 +37,8 @@ namespace sycl {
 struct paras_event_state {
     bool profiling = false;
     std::uint64_t submit = 0, start = 0, end = 0;
+    std::function<void()> wait_fn;
+    std::function<bool()> done_fn;
 };
 
 inline std::uint64_t paras_now_ns() {
@@ -73,7 +76,10 @@ public:
 
     void set_dependencies(const std::vector<event>& deps) { m_deps = deps; }
 
-    void wait() const { wait_deps(); }
+    void wait() const {
+        wait_deps();
+        if (m_impl->wait_fn) m_impl->wait_fn();
+    }
 
     void wait_and_throw() const { wait(); }
 
@@ -92,6 +98,8 @@ public:
     template <typename Param>
     typename Param::return_type get_info() const {
         if constexpr (std::is_same_v<Param, info::event::command_execution_status>) {
+            if (m_impl->done_fn && !m_impl->done_fn())
+                return info::event_command_status::running;
             return info::event_command_status::complete;
         } else {
             return typename Param::return_type();
@@ -126,6 +134,14 @@ public:
         e.m_impl->submit = submit;
         e.m_impl->start = start;
         e.m_impl->end = end;
+        return e;
+    }
+
+    static event paras_async(backend event_backend, std::function<void()> wait_fn,
+                             std::function<bool()> done_fn) {
+        event e(event_backend);
+        e.m_impl->wait_fn = std::move(wait_fn);
+        e.m_impl->done_fn = std::move(done_fn);
         return e;
     }
 
