@@ -22,6 +22,14 @@ add_executable(parascc
 	driver/ParaSDeviceFunctionMarker.cpp
 	driver/ParaSDeviceCallGraph.cpp
 )
+
+if(DEFINED LLVM_ENABLE_RTTI AND NOT LLVM_ENABLE_RTTI)
+	target_compile_options(parascc PRIVATE -fno-rtti)
+	message(STATUS "RTTI            : off (matching LLVM)")
+else()
+	message(STATUS "RTTI            : on")
+endif()
+
 target_link_libraries(parascc
  	PRIVATE
  	clangTooling
