@@ -142,7 +142,8 @@ public:
     cuda_threadpool(cuda_threadpool&& other) noexcept
         : stream(other.stream), ownsStream(other.ownsStream), dev_(std::move(other.dev_)),
           ctx_(std::move(other.ctx_)), props_(std::move(other.props_)),
-          queue_(std::move(other.queue_)), id_(other.id_) {
+          queue_(std::move(other.queue_)), id_(other.id_),
+          stream_alive_(std::move(other.stream_alive_)) {
         other.stream = nullptr;
         other.ownsStream = false;
     }
@@ -156,6 +157,7 @@ public:
 
         stream = other.stream;
         ownsStream = other.ownsStream;
+        stream_alive_ = std::move(other.stream_alive_);
         dev_ = std::move(other.dev_);
         ctx_ = std::move(other.ctx_);
         props_ = std::move(other.props_);
@@ -172,10 +174,37 @@ public:
         return props_.has_profiling() ? sycl::paras_now_ns() : 0;
     }
     sycl::event paras_finish_event(std::uint64_t t0) const {
+        if (async_launch()) {
+            cudaStream_t s = stream;
+            std::shared_ptr<bool> alive = stream_alive_;
+            return sycl::event::paras_async(
+                sycl::backend::cuda,
+                [s, alive] {
+                    if (!(alive && *alive)) return;
+                    const cudaError_t err = cudaStreamSynchronize(s);
+                    if (err != cudaSuccess)
+                        throw sycl::exception(std::string("kernel execution failed: ") +
+                                              cudaGetErrorString(err));
+                },
+                [s, alive] { return !(alive && *alive) || cudaStreamQuery(s) == cudaSuccess; });
+        }
         if (!props_.has_profiling()) {
             return sycl::event{};
         }
         return sycl::event::paras_profiled(t0, t0, sycl::paras_now_ns());
+    }
+
+    bool async_launch() const { return async_launch_ && !props_.has_profiling(); }
+
+    const cudaDeviceProp& device_props() {
+        if (!device_props_valid_) {
+            const cudaError_t err = cudaGetDeviceProperties(&device_props_, dev_.get_native_id());
+            if (err != cudaSuccess)
+                throw sycl::exception(std::string("cudaGetDeviceProperties failed: ") +
+                                      cudaGetErrorString(err));
+            device_props_valid_ = true;
+        }
+        return device_props_;
     }
     bool is_in_order() const { return props_.has_in_order(); }
     const void* paras_identity() const noexcept { return id_.get(); }
@@ -306,6 +335,10 @@ public:
                                      cudaGetErrorString(err));
         }
 
+        if (stream_ordered_copy(dest, src)) {
+            return paras_finish_event(paras_t0);
+        }
+
         err = cudaStreamSynchronize(stream);
         if (err != cudaSuccess) {
             throw std::runtime_error(std::string("cudaStreamSynchronize after memcpy failed: ") +
@@ -325,6 +358,10 @@ public:
 
         if (err != cudaSuccess) {
             throw sycl::exception(cudaGetErrorString(err));
+        }
+
+        if (stream_ordered_copy(dest, src)) {
+            return paras_finish_event(paras_t0);
         }
 
         err = cudaStreamSynchronize(stream);
@@ -347,6 +384,10 @@ public:
                                      cudaGetErrorString(err));
         }
 
+        if (async_launch()) {
+            return paras_finish_event(paras_t0);
+        }
+
         err = cudaStreamSynchronize(stream);
         if (err != cudaSuccess) {
             throw std::runtime_error(std::string("cudaStreamSynchronize after memset failed: ") +
@@ -358,12 +399,33 @@ public:
 
     ~cuda_threadpool() noexcept { release_stream_noexcept(); }
 
+    bool stream_ordered_copy(void* dest, const void* src) const {
+        if (!async_launch()) return false;
+        return is_device_pointer(dest) && is_device_pointer(src);
+    }
+
+    static bool is_device_pointer(const void* p) {
+        cudaPointerAttributes attr{};
+        if (cudaPointerGetAttributes(&attr, p) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return false;
+        }
+        return attr.type == cudaMemoryTypeDevice;
+    }
+
 private:
     sycl::device dev_;
     sycl::context ctx_{dev_};
     sycl::property_list props_;
     sycl::queue queue_;
     std::shared_ptr<int> id_{std::make_shared<int>()};
+    std::shared_ptr<bool> stream_alive_;
+    cudaDeviceProp device_props_{};
+    bool device_props_valid_ = false;
+    bool async_launch_ = [] {
+        const char* env = std::getenv("PARAS_ASYNC_KERNELS");
+        return env != nullptr && std::string(env) == "1";
+    }();
 
     void initialize_stream_for_device() {
         stream = nullptr;
@@ -409,6 +471,7 @@ private:
             ownsStream = false;
             throw sycl::exception(cudaGetErrorString(err));
         }
+        stream_alive_ = std::make_shared<bool>(true);
     }
 
     void release_stream_noexcept() noexcept {
@@ -432,6 +495,7 @@ private:
                       << cudaGetErrorString(syncErr) << '\n';
         }
 
+        if (stream_alive_) *stream_alive_ = false;
         cudaError_t err = cudaStreamDestroy(stream);
         if (err != cudaSuccess) {
             std::cerr << "cudaStreamDestroy failed: " << cudaGetErrorString(err) << '\n';
@@ -461,6 +525,14 @@ inline cuda_threadpool& sycl::queue::get_or_create_gpu_pool() const {
         gpu_pool_ = std::make_shared<cuda_threadpool>(*this);
     }
     return *gpu_pool_;
+}
+
+inline sycl::event sycl::queue::paras_submit_event() const {
+    cuda_threadpool& pool = get_or_create_gpu_pool();
+    if (pool.async_launch()) {
+        return pool.paras_finish_event(0);
+    }
+    return event{get_backend()};
 }
 
 #elif (PARAS_HIP_BACKEND)
@@ -964,7 +1036,11 @@ namespace sycl {
 
 inline void handler::wait_for_prior_commands() {
     wait_for_dependencies();
-#if (PARAS_HIP_BACKEND)
+#if (PARAS_CUDA_BACKEND)
+    if (gpu_pool_ != nullptr && gpu_pool_->async_launch()) {
+        gpu_pool_->wait();
+    }
+#elif (PARAS_HIP_BACKEND)
     if (rocm_pool_ != nullptr && rocm_pool_->async_launch()) {
         rocm_pool_->wait();
     }

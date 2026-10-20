@@ -91,6 +91,7 @@ public:
 #if (PARAS_CUDA_BACKEND)
             handler h(get_or_create_gpu_pool());
             cgf(h);
+            return paras_submit_event();
 #elif (PARAS_HIP_BACKEND)
             handler h(get_or_create_rocm_pool());
             cgf(h);

@@ -84,10 +84,7 @@ void cuda_threadpool::gpu_execute_nd_range_1D(const sycl::nd_range<1>& r, Func f
     paras_cuda_detail::check(cudaSetDevice(dev_.get_native_id()),
                              "cudaSetDevice before 1D nd_range kernel");
 
-    cudaDeviceProp props{};
-
-    paras_cuda_detail::check(cudaGetDeviceProperties(&props, dev_.get_native_id()),
-                             "cudaGetDeviceProperties for 1D nd_range");
+    const cudaDeviceProp& props = device_props();
 
     if (localSize > static_cast<std::size_t>(props.maxThreadsPerBlock)) {
         throw sycl::exception(sycl::make_error_code(sycl::errc::nd_range),
@@ -113,7 +110,9 @@ void cuda_threadpool::gpu_execute_nd_range_1D(const sycl::nd_range<1>& r, Func f
 
     paras_cuda_detail::check(cudaGetLastError(), "1D nd_range kernel launch failed");
 
-    paras_cuda_detail::check(cudaStreamSynchronize(stream), "1D nd_range kernel execution failed");
+    if (!async_launch()) {
+        paras_cuda_detail::check(cudaStreamSynchronize(stream), "1D nd_range kernel execution failed");
+    }
 }
 
 #elif (PARAS_HIP_BACKEND)

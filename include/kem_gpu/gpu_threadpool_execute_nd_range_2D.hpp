@@ -73,9 +73,7 @@ void cuda_threadpool::gpu_execute_nd_range_2D(const sycl::nd_range<2>& r, Func f
     paras_cuda_detail::check(cudaSetDevice(dev_.get_native_id()),
                              "cudaSetDevice before 2D nd_range kernel");
 
-    cudaDeviceProp props{};
-    paras_cuda_detail::check(cudaGetDeviceProperties(&props, dev_.get_native_id()),
-                             "cudaGetDeviceProperties for 2D nd_range");
+    const cudaDeviceProp& props = device_props();
     if (sharedMemoryBytes > static_cast<std::size_t>(props.sharedMemPerBlock)) {
         throw sycl::exception(sycl::make_error_code(sycl::errc::memory_allocation),
                               "2D local_accessor allocation exceeds CUDA shared memory per block");
@@ -99,7 +97,9 @@ void cuda_threadpool::gpu_execute_nd_range_2D(const sycl::nd_range<2>& r, Func f
         global0, global1, globalRange, localRange, launchedGroupRange, f);
 
     paras_cuda_detail::check(cudaGetLastError(), "2D nd_range kernel launch failed");
-    paras_cuda_detail::check(cudaStreamSynchronize(stream), "2D nd_range kernel execution failed");
+    if (!async_launch()) {
+        paras_cuda_detail::check(cudaStreamSynchronize(stream), "2D nd_range kernel execution failed");
+    }
 }
 #elif (PARAS_HIP_BACKEND)
 template <typename Func>

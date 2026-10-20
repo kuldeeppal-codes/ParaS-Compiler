@@ -79,7 +79,9 @@ void cuda_threadpool::gpu_execute_2D(const sycl::range<2>& r, Func f) {
     (void)cudaGetLastError();
     gpu_execute_2D_grid_kernel<<<grid, block, 0, stream>>>(rows, cols, f);
     paras_cuda_detail::check(cudaGetLastError(), "2D kernel launch failed");
-    paras_cuda_detail::check(cudaStreamSynchronize(stream), "2D kernel execution failed");
+    if (!async_launch()) {
+        paras_cuda_detail::check(cudaStreamSynchronize(stream), "2D kernel execution failed");
+    }
 }
 
 template <typename Func>
@@ -98,7 +100,9 @@ void cuda_threadpool::gpu_execute_3D(const sycl::range<3>& r, Func f) {
     (void)cudaGetLastError();
     gpu_execute_3D_linear_kernel<<<blocks, threadsPerBlock, 0, stream>>>(X, Y, Z, f);
     paras_cuda_detail::check(cudaGetLastError(), "3D kernel launch failed");
-    paras_cuda_detail::check(cudaStreamSynchronize(stream), "3D kernel execution failed");
+    if (!async_launch()) {
+        paras_cuda_detail::check(cudaStreamSynchronize(stream), "3D kernel execution failed");
+    }
 }
 
 #elif (PARAS_HIP_BACKEND)
