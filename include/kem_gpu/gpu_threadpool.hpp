@@ -181,12 +181,18 @@ public:
                 sycl::backend::cuda,
                 [s, alive] {
                     if (!(alive && *alive)) return;
+                    if (stream_recording(s))
+                        throw sycl::exception(sycl::make_error_code(sycl::errc::invalid),
+                                              "event::wait on a command recorded into a graph");
                     const cudaError_t err = cudaStreamSynchronize(s);
                     if (err != cudaSuccess)
                         throw sycl::exception(std::string("kernel execution failed: ") +
                                               cudaGetErrorString(err));
                 },
-                [s, alive] { return !(alive && *alive) || cudaStreamQuery(s) == cudaSuccess; });
+                [s, alive] {
+                    return !(alive && *alive) ||
+                           (!stream_recording(s) && cudaStreamQuery(s) == cudaSuccess);
+                });
         }
         if (!props_.has_profiling()) {
             return sycl::event{};
@@ -194,7 +200,18 @@ public:
         return sycl::event::paras_profiled(t0, t0, sycl::paras_now_ns());
     }
 
-    bool async_launch() const { return async_launch_ && !props_.has_profiling(); }
+    bool async_launch() const {
+        return (async_launch_ || recording_) && !props_.has_profiling();
+    }
+
+    bool is_recording() const noexcept { return recording_; }
+    void paras_begin_recording();
+    std::shared_ptr<void> paras_end_recording();
+    std::shared_ptr<void> paras_instantiate_graph(void* graph);
+    sycl::event paras_launch_graph(void* exec);
+    sycl::ext::oneapi::experimental::queue_state ext_oneapi_get_state() const;
+    sycl::event ext_oneapi_graph(const sycl::ext::oneapi::experimental::command_graph<
+                                 sycl::ext::oneapi::experimental::graph_state::executable>& graph);
 
     const cudaDeviceProp& device_props() {
         if (!device_props_valid_) {
@@ -237,6 +254,7 @@ public:
     void spawn_ND(Func f);
 
     void wait() {
+        if (recording_) fail_recording("queue::wait");
         ensure_stream();
         cudaError_t errSync = cudaStreamSynchronize(stream);
         if (errSync != cudaSuccess) {
@@ -255,6 +273,7 @@ public:
     }
 
     void wait() const {
+        if (recording_) fail_recording("queue::wait");
         if (stream == nullptr) {
             throw sycl::exception("cuda_threadpool::wait called with null CUDA stream");
         }
@@ -327,6 +346,8 @@ public:
     sycl::event memcpy(void* dest, const void* src, size_t numBytes) {
         const std::uint64_t paras_t0 = paras_profiling_start();
         ensure_stream();
+        if (recording_ && !stream_ordered_copy(dest, src))
+            fail_recording("a copy to or from host memory");
 
         cudaError_t err = cudaMemcpyAsync(dest, src, numBytes, cudaMemcpyDefault, stream);
 
@@ -352,6 +373,8 @@ public:
     sycl::event copy(const T* src, T* dest, size_t count) {
         const std::uint64_t paras_t0 = paras_profiling_start();
         ensure_stream();
+        if (recording_ && !stream_ordered_copy(dest, src))
+            fail_recording("a copy to or from host memory");
 
         cudaError_t err = cudaMemcpyAsync(static_cast<void*>(dest), static_cast<const void*>(src),
                                           count * sizeof(T), cudaMemcpyDefault, stream);
@@ -426,6 +449,19 @@ private:
         const char* env = std::getenv("PARAS_ASYNC_KERNELS");
         return env != nullptr && std::string(env) == "1";
     }();
+    bool recording_ = false;
+    mutable std::string record_error_;
+
+    [[noreturn]] void fail_recording(const char* what) const {
+        record_error_ = std::string(what) + " cannot be recorded into a graph";
+        throw sycl::exception(sycl::make_error_code(sycl::errc::feature_not_supported),
+                              record_error_);
+    }
+
+    static bool stream_recording(cudaStream_t s) {
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        return cudaStreamIsCapturing(s, &status) == cudaSuccess && status == cudaStreamCaptureStatusActive;
+    }
 
     void initialize_stream_for_device() {
         stream = nullptr;
@@ -667,12 +703,18 @@ public:
                 sycl::backend::hip,
                 [s, alive] {
                     if (!(alive && *alive)) return;
+                    if (stream_recording(s))
+                        throw sycl::exception(sycl::make_error_code(sycl::errc::invalid),
+                                              "event::wait on a command recorded into a graph");
                     const hipError_t err = hipStreamSynchronize(s);
                     if (err != hipSuccess)
                         throw sycl::exception(std::string("kernel execution failed: ") +
                                               hipGetErrorString(err));
                 },
-                [s, alive] { return !(alive && *alive) || hipStreamQuery(s) == hipSuccess; });
+                [s, alive] {
+                    return !(alive && *alive) ||
+                           (!stream_recording(s) && hipStreamQuery(s) == hipSuccess);
+                });
         }
         if (!props_.has_profiling()) {
             return sycl::event{};
@@ -680,7 +722,18 @@ public:
         return sycl::event::paras_profiled(t0, t0, sycl::paras_now_ns());
     }
 
-    bool async_launch() const { return async_launch_ && !props_.has_profiling(); }
+    bool async_launch() const {
+        return (async_launch_ || recording_) && !props_.has_profiling();
+    }
+
+    bool is_recording() const noexcept { return recording_; }
+    void paras_begin_recording();
+    std::shared_ptr<void> paras_end_recording();
+    std::shared_ptr<void> paras_instantiate_graph(void* graph);
+    sycl::event paras_launch_graph(void* exec);
+    sycl::ext::oneapi::experimental::queue_state ext_oneapi_get_state() const;
+    sycl::event ext_oneapi_graph(const sycl::ext::oneapi::experimental::command_graph<
+                                 sycl::ext::oneapi::experimental::graph_state::executable>& graph);
 
     const hipDeviceProp_t& device_props() {
         if (!device_props_valid_) {
@@ -720,6 +773,7 @@ public:
     void spawn_ND(Func f);
 
     void wait() {
+        if (recording_) fail_recording("queue::wait");
         ensure_stream();
         hipError_t errSync = hipStreamSynchronize(stream);
         if (errSync != hipSuccess) {
@@ -738,6 +792,7 @@ public:
     }
 
     void wait() const {
+        if (recording_) fail_recording("queue::wait");
         if (stream == nullptr) {
             throw sycl::exception("rocm_threadpool::wait called with null HIP stream");
         }
@@ -809,6 +864,8 @@ public:
     sycl::event memcpy(void* dest, const void* src, size_t numBytes) {
         const std::uint64_t paras_t0 = paras_profiling_start();
         ensure_stream();
+        if (recording_ && !stream_ordered_copy(dest, src))
+            fail_recording("a copy to or from host memory");
 
         hipError_t err = hipMemcpyAsync(dest, src, numBytes, hipMemcpyDefault, stream);
 
@@ -834,6 +891,8 @@ public:
     sycl::event copy(const T* src, T* dest, size_t count) {
         const std::uint64_t paras_t0 = paras_profiling_start();
         ensure_stream();
+        if (recording_ && !stream_ordered_copy(dest, src))
+            fail_recording("a copy to or from host memory");
 
         hipError_t err = hipMemcpyAsync(static_cast<void*>(dest), static_cast<const void*>(src),
                                         count * sizeof(T), hipMemcpyDefault, stream);
@@ -913,6 +972,19 @@ private:
         const char* env = std::getenv("PARAS_ASYNC_KERNELS");
         return env != nullptr && std::string(env) == "1";
     }();
+    bool recording_ = false;
+    mutable std::string record_error_;
+
+    [[noreturn]] void fail_recording(const char* what) const {
+        record_error_ = std::string(what) + " cannot be recorded into a graph";
+        throw sycl::exception(sycl::make_error_code(sycl::errc::feature_not_supported),
+                              record_error_);
+    }
+
+    static bool stream_recording(hipStream_t s) {
+        hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+        return hipStreamIsCapturing(s, &status) == hipSuccess && status == hipStreamCaptureStatusActive;
+    }
 
     void initialize_stream_for_device() {
         stream = nullptr;
@@ -1200,6 +1272,7 @@ void rocm_threadpool::spawn_ND(Func f) {
 #endif
 
 #include "kem_gpu/handler_impl.hpp"
+#include "kem_gpu/command_graph_impl.hpp"
 
 inline void sycl::queue::wait() const {
 #if (PARAS_CUDA_BACKEND)

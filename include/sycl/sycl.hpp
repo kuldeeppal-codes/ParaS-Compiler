@@ -60,6 +60,7 @@
 #include "private_ptr.hpp"
 #include "property_list.hpp"
 #include "queue.hpp"
+#include "graph.hpp"
 #include "range.hpp"
 #include "sampler.hpp"
 #include "image.hpp"

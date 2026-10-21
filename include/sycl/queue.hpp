@@ -34,6 +34,7 @@
 #include "device.hpp"
 #include "device_selector.hpp"
 #include "event.hpp"
+#include "graph_types.hpp"
 #include "handler.hpp"
 #include "property_list.hpp"
 #include "utilities/selector_logic.hpp"
@@ -140,6 +141,13 @@ public:
     event fill(T* ptr, const T& pattern, std::size_t count, const std::vector<event>&) {
         return fill(ptr, pattern, count);
     }
+
+    ext::oneapi::experimental::queue_state ext_oneapi_get_state() const;
+    event ext_oneapi_graph(const ext::oneapi::experimental::command_graph<
+                           ext::oneapi::experimental::graph_state::executable>& graph);
+    void paras_begin_recording() const;
+    std::shared_ptr<void> paras_end_recording() const;
+    std::shared_ptr<void> paras_instantiate_graph(void* graph) const;
 
     event paras_submit_event() const;
 
