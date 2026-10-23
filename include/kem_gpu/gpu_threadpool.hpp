@@ -49,6 +49,20 @@
 
 #include "gpu_utilities.hpp"
 
+#include <memory>
+
+class paras_shared_flag {
+public:
+    operator bool() const noexcept { return *value_; }
+    paras_shared_flag& operator=(bool v) noexcept {
+        *value_ = v;
+        return *this;
+    }
+
+private:
+    std::shared_ptr<bool> value_ = std::make_shared<bool>(false);
+};
+
 #if (PARAS_CUDA_BACKEND)
 #include <cuda_runtime.h>
 
@@ -102,6 +116,7 @@ public:
     bool operator!=(const cuda_threadpool& rhs) const noexcept { return !(*this == rhs); }
 
     cuda_threadpool(const sycl::queue& q) : dev_(q.get_device()), ctx_(q.get_context()), queue_(q) {
+        queue_.paras_detach_pool();
         initialize_stream_for_device();
     }
 
@@ -119,7 +134,8 @@ public:
     cuda_threadpool(const cuda_threadpool& other)
         : stream(other.stream), ownsStream(other.ownsStream), dev_(other.dev_), ctx_(other.ctx_),
           props_(other.props_), queue_(other.queue_), id_(other.id_),
-          stream_alive_(other.stream_alive_), stream_owner_(other.stream_owner_) {}
+          stream_alive_(other.stream_alive_), stream_owner_(other.stream_owner_),
+          recording_(other.recording_), record_error_(other.record_error_) {}
 
     cuda_threadpool& operator=(const cuda_threadpool& other) {
         if (this == &other) {
@@ -137,6 +153,8 @@ public:
         ownsStream = other.ownsStream;
         stream_alive_ = other.stream_alive_;
         stream_owner_ = other.stream_owner_;
+        recording_ = other.recording_;
+        record_error_ = other.record_error_;
         return *this;
     }
 
@@ -144,7 +162,8 @@ public:
         : stream(other.stream), ownsStream(other.ownsStream), dev_(std::move(other.dev_)),
           ctx_(std::move(other.ctx_)), props_(std::move(other.props_)),
           queue_(std::move(other.queue_)), id_(other.id_),
-          stream_alive_(std::move(other.stream_alive_)), stream_owner_(std::move(other.stream_owner_)) {
+          stream_alive_(std::move(other.stream_alive_)), stream_owner_(std::move(other.stream_owner_)),
+          recording_(other.recording_), record_error_(other.record_error_) {
         other.stream = nullptr;
         other.ownsStream = false;
     }
@@ -160,6 +179,8 @@ public:
         ownsStream = other.ownsStream;
         stream_alive_ = std::move(other.stream_alive_);
         stream_owner_ = std::move(other.stream_owner_);
+        recording_ = other.recording_;
+        record_error_ = other.record_error_;
         dev_ = std::move(other.dev_);
         ctx_ = std::move(other.ctx_);
         props_ = std::move(other.props_);
@@ -198,11 +219,12 @@ public:
     sycl::event paras_finish_event(std::uint64_t t0) const {
         if (async_launch()) return paras_stream_event();
         if (!props_.has_profiling()) {
-            return sycl::event{};
+            return stream != nullptr ? paras_stream_event() : sycl::event{};
         }
         return sycl::event::paras_profiled(t0, t0, sycl::paras_now_ns());
     }
 
+    bool paras_profiling() const noexcept { return props_.has_profiling(); }
     bool async_launch() const {
         return (async_launch_ || recording_) && !props_.has_profiling();
     }
@@ -453,13 +475,13 @@ private:
         const char* env = std::getenv("PARAS_ASYNC_KERNELS");
         return env != nullptr && std::string(env) == "1";
     }();
-    bool recording_ = false;
-    mutable std::string record_error_;
+    paras_shared_flag recording_;
+    std::shared_ptr<std::string> record_error_ = std::make_shared<std::string>();
 
     [[noreturn]] void fail_recording(const char* what) const {
-        record_error_ = std::string(what) + " cannot be recorded into a graph";
+        *record_error_ = std::string(what) + " cannot be recorded into a graph";
         throw sycl::exception(sycl::make_error_code(sycl::errc::feature_not_supported),
-                              record_error_);
+                              *record_error_);
     }
 
     static bool stream_recording(cudaStream_t s) {
@@ -552,15 +574,12 @@ private:
 };
 
 inline cuda_threadpool& sycl::queue::get_or_create_gpu_pool() const {
-    if (!gpu_pool_) {
-        gpu_pool_ = std::make_shared<cuda_threadpool>(*this);
-    }
-    return *gpu_pool_;
+    return gpu_pool_.get_or_create([this] { return std::make_shared<cuda_threadpool>(*this); });
 }
 
 inline sycl::event sycl::queue::paras_submit_event() const {
     cuda_threadpool& pool = get_or_create_gpu_pool();
-    if (pool.async_launch()) {
+    if (pool.async_launch() || !pool.paras_profiling()) {
         return pool.paras_finish_event(0);
     }
     return event{get_backend()};
@@ -619,6 +638,7 @@ public:
     bool operator!=(const rocm_threadpool& rhs) const noexcept { return !(*this == rhs); }
 
     rocm_threadpool(const sycl::queue& q) : dev_(q.get_device()), ctx_(q.get_context()), queue_(q) {
+        queue_.paras_detach_pool();
         initialize_stream_for_device();
     }
 
@@ -636,7 +656,8 @@ public:
     rocm_threadpool(const rocm_threadpool& other)
         : stream(other.stream), ownsStream(other.ownsStream), dev_(other.dev_), ctx_(other.ctx_),
           props_(other.props_), queue_(other.queue_), id_(other.id_),
-          stream_alive_(other.stream_alive_), stream_owner_(other.stream_owner_) {}
+          stream_alive_(other.stream_alive_), stream_owner_(other.stream_owner_),
+          recording_(other.recording_), record_error_(other.record_error_) {}
 
     rocm_threadpool& operator=(const rocm_threadpool& other) {
         if (this == &other) {
@@ -654,6 +675,8 @@ public:
         ownsStream = other.ownsStream;
         stream_alive_ = other.stream_alive_;
         stream_owner_ = other.stream_owner_;
+        recording_ = other.recording_;
+        record_error_ = other.record_error_;
         return *this;
     }
 
@@ -661,7 +684,8 @@ public:
         : stream(other.stream), ownsStream(other.ownsStream), dev_(std::move(other.dev_)),
           ctx_(std::move(other.ctx_)), props_(std::move(other.props_)),
           queue_(std::move(other.queue_)), id_(other.id_),
-          stream_alive_(std::move(other.stream_alive_)), stream_owner_(std::move(other.stream_owner_)) {
+          stream_alive_(std::move(other.stream_alive_)), stream_owner_(std::move(other.stream_owner_)),
+          recording_(other.recording_), record_error_(other.record_error_) {
         other.stream = nullptr;
         other.ownsStream = false;
     }
@@ -677,6 +701,8 @@ public:
         ownsStream = other.ownsStream;
         stream_alive_ = std::move(other.stream_alive_);
         stream_owner_ = std::move(other.stream_owner_);
+        recording_ = other.recording_;
+        record_error_ = other.record_error_;
         dev_ = std::move(other.dev_);
         ctx_ = std::move(other.ctx_);
         props_ = std::move(other.props_);
@@ -715,11 +741,12 @@ public:
     sycl::event paras_finish_event(std::uint64_t t0) const {
         if (async_launch()) return paras_stream_event();
         if (!props_.has_profiling()) {
-            return sycl::event{};
+            return stream != nullptr ? paras_stream_event() : sycl::event{};
         }
         return sycl::event::paras_profiled(t0, t0, sycl::paras_now_ns());
     }
 
+    bool paras_profiling() const noexcept { return props_.has_profiling(); }
     bool async_launch() const {
         return (async_launch_ || recording_) && !props_.has_profiling();
     }
@@ -971,13 +998,13 @@ private:
         const char* env = std::getenv("PARAS_ASYNC_KERNELS");
         return env != nullptr && std::string(env) == "1";
     }();
-    bool recording_ = false;
-    mutable std::string record_error_;
+    paras_shared_flag recording_;
+    std::shared_ptr<std::string> record_error_ = std::make_shared<std::string>();
 
     [[noreturn]] void fail_recording(const char* what) const {
-        record_error_ = std::string(what) + " cannot be recorded into a graph";
+        *record_error_ = std::string(what) + " cannot be recorded into a graph";
         throw sycl::exception(sycl::make_error_code(sycl::errc::feature_not_supported),
-                              record_error_);
+                              *record_error_);
     }
 
     static bool stream_recording(hipStream_t s) {
@@ -1070,15 +1097,12 @@ private:
 };
 
 inline rocm_threadpool& sycl::queue::get_or_create_rocm_pool() const {
-    if (!rocm_pool_) {
-        rocm_pool_ = std::make_shared<rocm_threadpool>(*this);
-    }
-    return *rocm_pool_;
+    return rocm_pool_.get_or_create([this] { return std::make_shared<rocm_threadpool>(*this); });
 }
 
 inline sycl::event sycl::queue::paras_submit_event() const {
     rocm_threadpool& pool = get_or_create_rocm_pool();
-    if (pool.async_launch()) {
+    if (pool.async_launch() || !pool.paras_profiling()) {
         return pool.paras_finish_event(0);
     }
     return event{get_backend()};
@@ -1099,9 +1123,9 @@ namespace sycl {
 inline void handler::wait_for_prior_commands() {
     wait_for_dependencies();
 #if (PARAS_CUDA_BACKEND)
-    if (gpu_pool_ != nullptr) gpu_pool_->wait();
+    if (gpu_pool_ != nullptr && gpu_pool_->get_device().is_gpu()) gpu_pool_->wait();
 #elif (PARAS_HIP_BACKEND)
-    if (rocm_pool_ != nullptr) rocm_pool_->wait();
+    if (rocm_pool_ != nullptr && rocm_pool_->get_device().is_gpu()) rocm_pool_->wait();
 #endif
 }
 

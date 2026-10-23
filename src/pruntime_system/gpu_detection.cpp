@@ -149,12 +149,23 @@ get_visible_indices(const char* envName, const std::size_t physicalDeviceCount) 
         return indices;
     }
 
-    const bool numeric = visibleDevices.find_first_not_of("0123456789, \t-") == std::string::npos;
-    if (!numeric) {
-        const std::size_t entries =
-            static_cast<std::size_t>(std::count(visibleDevices.begin(), visibleDevices.end(), ',')) + 1;
-        for (std::size_t i = 0; i < entries && i < physicalDeviceCount; ++i) indices.push_back(i);
-        return indices;
+    {
+        std::size_t uuids = 0, others = 0, start = 0;
+        while (start <= visibleDevices.size()) {
+            const std::size_t end = visibleDevices.find(',', start);
+            std::string token = visibleDevices.substr(start, end == std::string::npos ? std::string::npos : end - start);
+            trim_inplace(token);
+            if (!token.empty()) {
+                if (token.rfind("GPU-", 0) == 0 || token.rfind("MIG-", 0) == 0) ++uuids;
+                else ++others;
+            }
+            if (end == std::string::npos) break;
+            start = end + 1;
+        }
+        if (uuids > 0 && others == 0) {
+            for (std::size_t i = 0; i < uuids && i < physicalDeviceCount; ++i) indices.push_back(i);
+            return indices;
+        }
     }
 
     std::size_t start = 0;

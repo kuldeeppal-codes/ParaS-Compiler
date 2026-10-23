@@ -47,18 +47,27 @@ namespace sycl {
 template <typename Pool>
 class shared_pool_slot {
 public:
-    explicit operator bool() const { return static_cast<bool>(*slot_); }
-    bool operator==(std::nullptr_t) const { return !*slot_; }
-    bool operator!=(std::nullptr_t) const { return static_cast<bool>(*slot_); }
-    Pool* operator->() const { return slot_->get(); }
-    Pool& operator*() const { return **slot_; }
-    shared_pool_slot& operator=(std::shared_ptr<Pool> pool) {
-        *slot_ = std::move(pool);
-        return *this;
+    explicit operator bool() const { return static_cast<bool>(slot_->pool); }
+    bool operator==(std::nullptr_t) const { return !slot_->pool; }
+    bool operator!=(std::nullptr_t) const { return static_cast<bool>(slot_->pool); }
+    Pool* operator->() const { return slot_->pool.get(); }
+    Pool& operator*() const { return *slot_->pool; }
+
+    template <typename Make>
+    Pool& get_or_create(Make make) const {
+        std::lock_guard<std::mutex> lock(slot_->mutex);
+        if (!slot_->pool) slot_->pool = make();
+        return *slot_->pool;
     }
 
+    void detach() { slot_ = std::make_shared<Shared>(); }
+
 private:
-    std::shared_ptr<std::shared_ptr<Pool>> slot_ = std::make_shared<std::shared_ptr<Pool>>();
+    struct Shared {
+        std::mutex mutex;
+        std::shared_ptr<Pool> pool;
+    };
+    std::shared_ptr<Shared> slot_ = std::make_shared<Shared>();
 };
 
 class queue {
@@ -136,13 +145,13 @@ public:
 
     template <typename KernelName = void, typename Func>
     event single_task(event dep, Func f) {
-        dep.wait();
+        paras_wait_dependency(dep);
         return single_task<KernelName>(f);
     }
 
     template <typename KernelName = void, typename Func>
     event single_task(const std::vector<event>& deps, Func f) {
-        event::wait(deps);
+        paras_wait_dependencies(deps);
         return single_task<KernelName>(f);
     }
 
@@ -153,14 +162,30 @@ public:
 
     template <typename T>
     event fill(T* ptr, const T& pattern, std::size_t count, event dep) {
-        dep.wait();
+        paras_wait_dependency(dep);
         return fill(ptr, pattern, count);
     }
 
     template <typename T>
     event fill(T* ptr, const T& pattern, std::size_t count, const std::vector<event>& deps) {
-        event::wait(deps);
+        paras_wait_dependencies(deps);
         return fill(ptr, pattern, count);
+    }
+
+    void paras_wait_dependency(const event& e) {
+        if (ext_oneapi_get_state() != ext::oneapi::experimental::queue_state::recording) e.wait();
+    }
+    void paras_wait_dependencies(const std::vector<event>& events) {
+        if (ext_oneapi_get_state() != ext::oneapi::experimental::queue_state::recording)
+            event::wait(events);
+    }
+
+    void paras_detach_pool() {
+#if (PARAS_CUDA_BACKEND)
+        gpu_pool_.detach();
+#elif (PARAS_HIP_BACKEND)
+        rocm_pool_.detach();
+#endif
     }
 
     ext::oneapi::experimental::queue_state ext_oneapi_get_state() const;
@@ -193,13 +218,13 @@ public:
 
     template <typename KernelName = void, typename Func, int dim>
     event parallel_for(range<dim> r, event dep, Func f) {
-        dep.wait();
+        paras_wait_dependency(dep);
         return parallel_for<KernelName>(r, f);
     }
 
     template <typename KernelName = void, typename Func, int dim>
     event parallel_for(range<dim> r, const std::vector<event>& deps, Func f) {
-        event::wait(deps);
+        paras_wait_dependencies(deps);
         return parallel_for<KernelName>(r, f);
     }
 
@@ -210,13 +235,13 @@ public:
 
     template <typename KernelName = void, typename Func, int dim>
     event parallel_for(const nd_range<dim>& r, event dep, Func f) {
-        dep.wait();
+        paras_wait_dependency(dep);
         return parallel_for<KernelName>(r, f);
     }
 
     template <typename KernelName = void, typename Func, int dim>
     event parallel_for(const nd_range<dim>& r, const std::vector<event>& deps, Func f) {
-        event::wait(deps);
+        paras_wait_dependencies(deps);
         return parallel_for<KernelName>(r, f);
     }
 
@@ -231,11 +256,11 @@ public:
     }
 
     event memset(void* ptr, int value, size_t numBytes, const std::vector<event>& deps) {
-        event::wait(deps);
+        paras_wait_dependencies(deps);
         return memset(ptr, value, numBytes);
     }
     event memset(void* ptr, int value, size_t numBytes, event dep) {
-        dep.wait();
+        paras_wait_dependency(dep);
         return memset(ptr, value, numBytes);
     }
 
@@ -246,13 +271,13 @@ public:
 
     template <typename T>
     event copy(const T* src, T* dest, size_t count, const std::vector<event>& deps) {
-        event::wait(deps);
+        paras_wait_dependencies(deps);
         return copy(src, dest, count);
     }
 
     template <typename T>
     event copy(const T* src, T* dest, size_t count, event dep) {
-        dep.wait();
+        paras_wait_dependency(dep);
         return copy(src, dest, count);
     }
 
@@ -261,11 +286,11 @@ public:
     }
 
     event memcpy(void* dest, const void* src, size_t numBytes, event dep) {
-        dep.wait();
+        paras_wait_dependency(dep);
         return memcpy(dest, src, numBytes);
     }
     event memcpy(void* dest, const void* src, size_t numBytes, const std::vector<event>& deps) {
-        event::wait(deps);
+        paras_wait_dependencies(deps);
         return memcpy(dest, src, numBytes);
     }
 

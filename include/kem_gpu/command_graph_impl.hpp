@@ -37,7 +37,7 @@ inline void cuda_threadpool::paras_begin_recording() {
     ensure_stream();
     paras_cuda_detail::check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed),
                              "cudaStreamBeginCapture");
-    record_error_.clear();
+    record_error_->clear();
     recording_ = true;
 }
 
@@ -49,13 +49,13 @@ inline std::shared_ptr<void> cuda_threadpool::paras_end_recording() {
     ensure_stream();
     cudaGraph_t graph = nullptr;
     const cudaError_t err = cudaStreamEndCapture(stream, &graph);
-    if (err != cudaSuccess || graph == nullptr || !record_error_.empty()) {
+    if (err != cudaSuccess || graph == nullptr || !record_error_->empty()) {
         if (graph != nullptr) (void)cudaGraphDestroy(graph);
         (void)cudaGetLastError();
         throw sycl::exception(sycl::make_error_code(sycl::errc::invalid),
                               "command_graph recording failed: " +
-                                  (record_error_.empty() ? std::string(cudaGetErrorString(err))
-                                                         : record_error_));
+                                  (record_error_->empty() ? std::string(cudaGetErrorString(err))
+                                                         : *record_error_));
     }
     return std::shared_ptr<void>(graph,
                                  [](void* g) { (void)cudaGraphDestroy(static_cast<cudaGraph_t>(g)); });
@@ -115,7 +115,7 @@ inline void rocm_threadpool::paras_begin_recording() {
     ensure_stream();
     paras_rocm_detail::check(hipStreamBeginCapture(stream, hipStreamCaptureModeRelaxed),
                              "hipStreamBeginCapture");
-    record_error_.clear();
+    record_error_->clear();
     recording_ = true;
 }
 
@@ -127,13 +127,13 @@ inline std::shared_ptr<void> rocm_threadpool::paras_end_recording() {
     ensure_stream();
     hipGraph_t graph = nullptr;
     const hipError_t err = hipStreamEndCapture(stream, &graph);
-    if (err != hipSuccess || graph == nullptr || !record_error_.empty()) {
+    if (err != hipSuccess || graph == nullptr || !record_error_->empty()) {
         if (graph != nullptr) (void)hipGraphDestroy(graph);
         (void)hipGetLastError();
         throw sycl::exception(sycl::make_error_code(sycl::errc::invalid),
                               "command_graph recording failed: " +
-                                  (record_error_.empty() ? std::string(hipGetErrorString(err))
-                                                         : record_error_));
+                                  (record_error_->empty() ? std::string(hipGetErrorString(err))
+                                                         : *record_error_));
     }
     return std::shared_ptr<void>(graph,
                                  [](void* g) { (void)hipGraphDestroy(static_cast<hipGraph_t>(g)); });

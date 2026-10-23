@@ -102,11 +102,7 @@ public:
             throw sycl::exception(sycl::make_error_code(sycl::errc::invalid),
                                   "the queue's device is not the graph's device");
         q.paras_begin_recording();
-        std::shared_ptr<Queue> queue;
-        if constexpr (std::is_same_v<Queue, sycl::queue>)
-            queue = std::make_shared<Queue>(q);
-        else
-            queue = std::shared_ptr<Queue>(&q, [](Queue*) {});
+        auto queue = std::make_shared<Queue>(q);
         impl_->queue_identity = q.paras_identity();
         impl_->end = [queue] { return queue->paras_end_recording(); };
         impl_->instantiate = [queue](void* graph) { return queue->paras_instantiate_graph(graph); };
@@ -118,11 +114,7 @@ public:
         if (queues.size() != 1)
             throw sycl::exception(sycl::make_error_code(sycl::errc::feature_not_supported),
                                   "ParaS: a command_graph records one queue");
-        if constexpr (!std::is_same_v<Queue, sycl::queue>)
-            throw sycl::exception(sycl::make_error_code(sycl::errc::feature_not_supported),
-                                  "ParaS: pass the queue itself (in device code a copy is another stream)");
-        else
-            begin_recording(const_cast<Queue&>(queues.front()), props);
+        begin_recording(const_cast<Queue&>(queues.front()), props);
     }
 
     void end_recording() {
