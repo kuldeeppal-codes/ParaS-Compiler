@@ -117,10 +117,9 @@ public:
     }
 
     cuda_threadpool(const cuda_threadpool& other)
-        : dev_(other.dev_), ctx_(other.ctx_), props_(other.props_), queue_(other.queue_),
-          id_(other.id_) {
-        initialize_stream_for_device();
-    }
+        : stream(other.stream), ownsStream(other.ownsStream), dev_(other.dev_), ctx_(other.ctx_),
+          props_(other.props_), queue_(other.queue_), id_(other.id_),
+          stream_alive_(other.stream_alive_), stream_owner_(other.stream_owner_) {}
 
     cuda_threadpool& operator=(const cuda_threadpool& other) {
         if (this == &other) {
@@ -134,8 +133,10 @@ public:
         props_ = other.props_;
         queue_ = other.queue_;
         id_ = other.id_;
-
-        initialize_stream_for_device();
+        stream = other.stream;
+        ownsStream = other.ownsStream;
+        stream_alive_ = other.stream_alive_;
+        stream_owner_ = other.stream_owner_;
         return *this;
     }
 
@@ -143,7 +144,7 @@ public:
         : stream(other.stream), ownsStream(other.ownsStream), dev_(std::move(other.dev_)),
           ctx_(std::move(other.ctx_)), props_(std::move(other.props_)),
           queue_(std::move(other.queue_)), id_(other.id_),
-          stream_alive_(std::move(other.stream_alive_)) {
+          stream_alive_(std::move(other.stream_alive_)), stream_owner_(std::move(other.stream_owner_)) {
         other.stream = nullptr;
         other.ownsStream = false;
     }
@@ -158,6 +159,7 @@ public:
         stream = other.stream;
         ownsStream = other.ownsStream;
         stream_alive_ = std::move(other.stream_alive_);
+        stream_owner_ = std::move(other.stream_owner_);
         dev_ = std::move(other.dev_);
         ctx_ = std::move(other.ctx_);
         props_ = std::move(other.props_);
@@ -173,27 +175,28 @@ public:
     std::uint64_t paras_profiling_start() const {
         return props_.has_profiling() ? sycl::paras_now_ns() : 0;
     }
+    sycl::event paras_stream_event() const {
+        cudaStream_t s = stream;
+        std::shared_ptr<bool> alive = stream_alive_;
+        return sycl::event::paras_async(
+            sycl::backend::cuda,
+            [s, alive] {
+                if (!(alive && *alive)) return;
+                if (stream_recording(s))
+                    throw sycl::exception(sycl::make_error_code(sycl::errc::invalid),
+                                          "event::wait on a command recorded into a graph");
+                const cudaError_t err = cudaStreamSynchronize(s);
+                if (err != cudaSuccess)
+                    throw sycl::exception(std::string("kernel execution failed: ") +
+                                          cudaGetErrorString(err));
+            },
+            [s, alive] {
+                return !(alive && *alive) ||
+                       (!stream_recording(s) && cudaStreamQuery(s) != cudaErrorNotReady);
+            });
+    }
     sycl::event paras_finish_event(std::uint64_t t0) const {
-        if (async_launch()) {
-            cudaStream_t s = stream;
-            std::shared_ptr<bool> alive = stream_alive_;
-            return sycl::event::paras_async(
-                sycl::backend::cuda,
-                [s, alive] {
-                    if (!(alive && *alive)) return;
-                    if (stream_recording(s))
-                        throw sycl::exception(sycl::make_error_code(sycl::errc::invalid),
-                                              "event::wait on a command recorded into a graph");
-                    const cudaError_t err = cudaStreamSynchronize(s);
-                    if (err != cudaSuccess)
-                        throw sycl::exception(std::string("kernel execution failed: ") +
-                                              cudaGetErrorString(err));
-                },
-                [s, alive] {
-                    return !(alive && *alive) ||
-                           (!stream_recording(s) && cudaStreamQuery(s) == cudaSuccess);
-                });
-        }
+        if (async_launch()) return paras_stream_event();
         if (!props_.has_profiling()) {
             return sycl::event{};
         }
@@ -269,7 +272,7 @@ public:
     sycl::event parasSYCL_enqueue_custom_operation(injectCustomFunc cgf) {
         sycl::handler cgh(*this);
         cgh.parasSYCL_enqueue_custom_operation(std::move(cgf));
-        return sycl::event{};
+        return paras_stream_event();
     }
 
     void wait() const {
@@ -443,6 +446,7 @@ private:
     sycl::queue queue_;
     std::shared_ptr<int> id_{std::make_shared<int>()};
     std::shared_ptr<bool> stream_alive_;
+    std::shared_ptr<void> stream_owner_;
     cudaDeviceProp device_props_{};
     bool device_props_valid_ = false;
     bool async_launch_ = [] {
@@ -508,35 +512,26 @@ private:
             throw sycl::exception(cudaGetErrorString(err));
         }
         stream_alive_ = std::make_shared<bool>(true);
+        const int device = dev_.is_gpu() ? dev_.get_native_id() : -1;
+        std::shared_ptr<bool> alive = stream_alive_;
+        stream_owner_ = std::shared_ptr<void>(static_cast<void*>(stream), [device, alive](void* p) {
+            cudaStream_t s = static_cast<cudaStream_t>(p);
+            if (device >= 0) {
+                const cudaError_t setErr = cudaSetDevice(device);
+                if (setErr != cudaSuccess)
+                    std::cerr << "cudaSetDevice before cudaStreamDestroy failed: " << cudaGetErrorString(setErr) << '\n';
+            }
+            const cudaError_t syncErr = cudaStreamSynchronize(s);
+            if (syncErr != cudaSuccess)
+                std::cerr << "cudaStreamSynchronize before destroy failed: " << cudaGetErrorString(syncErr) << '\n';
+            *alive = false;
+            const cudaError_t err = cudaStreamDestroy(s);
+            if (err != cudaSuccess) std::cerr << "cudaStreamDestroy failed: " << cudaGetErrorString(err) << '\n';
+        });
     }
 
     void release_stream_noexcept() noexcept {
-        if (!ownsStream || stream == nullptr) {
-            stream = nullptr;
-            ownsStream = false;
-            return;
-        }
-
-        if (dev_.is_gpu()) {
-            cudaError_t setErr = cudaSetDevice(dev_.get_native_id());
-            if (setErr != cudaSuccess) {
-                std::cerr << "cudaSetDevice before cudaStreamDestroy failed: "
-                          << cudaGetErrorString(setErr) << '\n';
-            }
-        }
-
-        cudaError_t syncErr = cudaStreamSynchronize(stream);
-        if (syncErr != cudaSuccess) {
-            std::cerr << "cudaStreamSynchronize before destroy failed: "
-                      << cudaGetErrorString(syncErr) << '\n';
-        }
-
-        if (stream_alive_) *stream_alive_ = false;
-        cudaError_t err = cudaStreamDestroy(stream);
-        if (err != cudaSuccess) {
-            std::cerr << "cudaStreamDestroy failed: " << cudaGetErrorString(err) << '\n';
-        }
-
+        stream_owner_.reset();
         stream = nullptr;
         ownsStream = false;
     }
@@ -639,10 +634,9 @@ public:
     }
 
     rocm_threadpool(const rocm_threadpool& other)
-        : dev_(other.dev_), ctx_(other.ctx_), props_(other.props_), queue_(other.queue_),
-          id_(other.id_) {
-        initialize_stream_for_device();
-    }
+        : stream(other.stream), ownsStream(other.ownsStream), dev_(other.dev_), ctx_(other.ctx_),
+          props_(other.props_), queue_(other.queue_), id_(other.id_),
+          stream_alive_(other.stream_alive_), stream_owner_(other.stream_owner_) {}
 
     rocm_threadpool& operator=(const rocm_threadpool& other) {
         if (this == &other) {
@@ -656,8 +650,10 @@ public:
         props_ = other.props_;
         queue_ = other.queue_;
         id_ = other.id_;
-
-        initialize_stream_for_device();
+        stream = other.stream;
+        ownsStream = other.ownsStream;
+        stream_alive_ = other.stream_alive_;
+        stream_owner_ = other.stream_owner_;
         return *this;
     }
 
@@ -665,7 +661,7 @@ public:
         : stream(other.stream), ownsStream(other.ownsStream), dev_(std::move(other.dev_)),
           ctx_(std::move(other.ctx_)), props_(std::move(other.props_)),
           queue_(std::move(other.queue_)), id_(other.id_),
-          stream_alive_(std::move(other.stream_alive_)) {
+          stream_alive_(std::move(other.stream_alive_)), stream_owner_(std::move(other.stream_owner_)) {
         other.stream = nullptr;
         other.ownsStream = false;
     }
@@ -680,6 +676,7 @@ public:
         stream = other.stream;
         ownsStream = other.ownsStream;
         stream_alive_ = std::move(other.stream_alive_);
+        stream_owner_ = std::move(other.stream_owner_);
         dev_ = std::move(other.dev_);
         ctx_ = std::move(other.ctx_);
         props_ = std::move(other.props_);
@@ -695,27 +692,28 @@ public:
     std::uint64_t paras_profiling_start() const {
         return props_.has_profiling() ? sycl::paras_now_ns() : 0;
     }
+    sycl::event paras_stream_event() const {
+        hipStream_t s = stream;
+        std::shared_ptr<bool> alive = stream_alive_;
+        return sycl::event::paras_async(
+            sycl::backend::hip,
+            [s, alive] {
+                if (!(alive && *alive)) return;
+                if (stream_recording(s))
+                    throw sycl::exception(sycl::make_error_code(sycl::errc::invalid),
+                                          "event::wait on a command recorded into a graph");
+                const hipError_t err = hipStreamSynchronize(s);
+                if (err != hipSuccess)
+                    throw sycl::exception(std::string("kernel execution failed: ") +
+                                          hipGetErrorString(err));
+            },
+            [s, alive] {
+                return !(alive && *alive) ||
+                       (!stream_recording(s) && hipStreamQuery(s) != hipErrorNotReady);
+            });
+    }
     sycl::event paras_finish_event(std::uint64_t t0) const {
-        if (async_launch()) {
-            hipStream_t s = stream;
-            std::shared_ptr<bool> alive = stream_alive_;
-            return sycl::event::paras_async(
-                sycl::backend::hip,
-                [s, alive] {
-                    if (!(alive && *alive)) return;
-                    if (stream_recording(s))
-                        throw sycl::exception(sycl::make_error_code(sycl::errc::invalid),
-                                              "event::wait on a command recorded into a graph");
-                    const hipError_t err = hipStreamSynchronize(s);
-                    if (err != hipSuccess)
-                        throw sycl::exception(std::string("kernel execution failed: ") +
-                                              hipGetErrorString(err));
-                },
-                [s, alive] {
-                    return !(alive && *alive) ||
-                           (!stream_recording(s) && hipStreamQuery(s) == hipSuccess);
-                });
-        }
+        if (async_launch()) return paras_stream_event();
         if (!props_.has_profiling()) {
             return sycl::event{};
         }
@@ -788,7 +786,7 @@ public:
     sycl::event parasSYCL_enqueue_custom_operation(injectCustomFunc cgf) {
         sycl::handler cgh(*this);
         cgh.parasSYCL_enqueue_custom_operation(std::move(cgf));
-        return sycl::event{};
+        return paras_stream_event();
     }
 
     void wait() const {
@@ -961,6 +959,7 @@ private:
     sycl::queue queue_;
     std::shared_ptr<int> id_{std::make_shared<int>()};
     std::shared_ptr<bool> stream_alive_;
+    std::shared_ptr<void> stream_owner_;
     hipDeviceProp_t device_props_{};
     bool device_props_valid_ = false;
     static void paras_rocm_detail_check_props(hipError_t err) {
@@ -1031,35 +1030,26 @@ private:
             throw sycl::exception(hipGetErrorString(err));
         }
         stream_alive_ = std::make_shared<bool>(true);
+        const int device = dev_.is_gpu() ? dev_.get_native_id() : -1;
+        std::shared_ptr<bool> alive = stream_alive_;
+        stream_owner_ = std::shared_ptr<void>(static_cast<void*>(stream), [device, alive](void* p) {
+            hipStream_t s = static_cast<hipStream_t>(p);
+            if (device >= 0) {
+                const hipError_t setErr = hipSetDevice(device);
+                if (setErr != hipSuccess)
+                    std::cerr << "hipSetDevice before hipStreamDestroy failed: " << hipGetErrorString(setErr) << '\n';
+            }
+            const hipError_t syncErr = hipStreamSynchronize(s);
+            if (syncErr != hipSuccess)
+                std::cerr << "hipStreamSynchronize before destroy failed: " << hipGetErrorString(syncErr) << '\n';
+            *alive = false;
+            const hipError_t err = hipStreamDestroy(s);
+            if (err != hipSuccess) std::cerr << "hipStreamDestroy failed: " << hipGetErrorString(err) << '\n';
+        });
     }
 
     void release_stream_noexcept() noexcept {
-        if (!ownsStream || stream == nullptr) {
-            stream = nullptr;
-            ownsStream = false;
-            return;
-        }
-
-        if (dev_.is_gpu()) {
-            hipError_t setErr = hipSetDevice(dev_.get_native_id());
-            if (setErr != hipSuccess) {
-                std::cerr << "hipSetDevice before hipStreamDestroy failed: "
-                          << hipGetErrorString(setErr) << '\n';
-            }
-        }
-
-        hipError_t syncErr = hipStreamSynchronize(stream);
-        if (syncErr != hipSuccess) {
-            std::cerr << "hipStreamSynchronize before destroy failed: "
-                      << hipGetErrorString(syncErr) << '\n';
-        }
-
-        if (stream_alive_) *stream_alive_ = false;
-        hipError_t err = hipStreamDestroy(stream);
-        if (err != hipSuccess) {
-            std::cerr << "hipStreamDestroy failed: " << hipGetErrorString(err) << '\n';
-        }
-
+        stream_owner_.reset();
         stream = nullptr;
         ownsStream = false;
     }
@@ -1109,13 +1099,9 @@ namespace sycl {
 inline void handler::wait_for_prior_commands() {
     wait_for_dependencies();
 #if (PARAS_CUDA_BACKEND)
-    if (gpu_pool_ != nullptr && gpu_pool_->async_launch()) {
-        gpu_pool_->wait();
-    }
+    if (gpu_pool_ != nullptr) gpu_pool_->wait();
 #elif (PARAS_HIP_BACKEND)
-    if (rocm_pool_ != nullptr && rocm_pool_->async_launch()) {
-        rocm_pool_->wait();
-    }
+    if (rocm_pool_ != nullptr) rocm_pool_->wait();
 #endif
 }
 
@@ -1236,9 +1222,7 @@ sycl::event cuda_threadpool::spawn_1D(Func f) {
 
 template <typename Func>
 sycl::event cuda_threadpool::spawn_1D_event(Func f) {
-
-    spawn_1D(f);
-    return sycl::event();
+    return spawn_1D(f);
 }
 
 template <typename Func>
@@ -1259,9 +1243,7 @@ sycl::event rocm_threadpool::spawn_1D(Func f) {
 
 template <typename Func>
 sycl::event rocm_threadpool::spawn_1D_event(Func f) {
-
-    spawn_1D(f);
-    return sycl::event();
+    return spawn_1D(f);
 }
 
 template <typename Func>
