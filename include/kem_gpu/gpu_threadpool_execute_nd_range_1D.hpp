@@ -22,6 +22,7 @@
 #define __PARAS_GPU_THREADPOOL_EXECUTE_NDRANGE_1D_HPP__
 
 #include <cstddef>
+#include <type_traits>
 #include <stdexcept>
 #include <sycl/id.hpp>
 #include <sycl/nd_item.hpp>
@@ -34,14 +35,25 @@
 #include <hip/hip_runtime.h>
 #endif
 
+namespace paras_detail {
+
+template <typename F, typename = void>
+struct nd_range_occupancy_hint : std::false_type {};
+
+template <typename F>
+struct nd_range_occupancy_hint<F, std::void_t<decltype(F::paras_max_work_group_size),
+                                              decltype(F::paras_min_waves_per_eu)>>
+    : std::true_type {
+    static constexpr int max_work_group_size = F::paras_max_work_group_size;
+    static constexpr int min_waves_per_eu = F::paras_min_waves_per_eu;
+};
+
+}
+
 template <typename Func>
-__global__ void gpu_execute_nd_range_1D_kernel(std::size_t globalSize, sycl::range<1> globalRange,
-                                               sycl::range<1> localRange, sycl::range<1> groupRange,
-                                               Func f) {
-    extern __shared__ unsigned char paras_dynamic_shared_memory[];
-
-    (void)paras_dynamic_shared_memory;
-
+__device__ inline void gpu_execute_nd_range_1D_body(std::size_t globalSize, sycl::range<1> globalRange,
+                                                    sycl::range<1> localRange, sycl::range<1> groupRange,
+                                                    const Func& f) {
     const std::size_t gid =
         static_cast<std::size_t>(blockIdx.x) * static_cast<std::size_t>(blockDim.x) +
         static_cast<std::size_t>(threadIdx.x);
@@ -56,6 +68,31 @@ __global__ void gpu_execute_nd_range_1D_kernel(std::size_t globalSize, sycl::ran
 
     f(item);
 }
+
+template <typename Func>
+__global__ void gpu_execute_nd_range_1D_kernel(std::size_t globalSize, sycl::range<1> globalRange,
+                                               sycl::range<1> localRange, sycl::range<1> groupRange,
+                                               Func f) {
+    extern __shared__ unsigned char paras_dynamic_shared_memory[];
+
+    (void)paras_dynamic_shared_memory;
+
+    gpu_execute_nd_range_1D_body(globalSize, globalRange, localRange, groupRange, f);
+}
+
+#if (PARAS_HIP_BACKEND)
+template <typename Func, int MaxThreads, int MinWaves>
+__global__ void __launch_bounds__(MaxThreads, MinWaves)
+    gpu_execute_nd_range_1D_bounded_kernel(std::size_t globalSize, sycl::range<1> globalRange,
+                                           sycl::range<1> localRange, sycl::range<1> groupRange,
+                                           Func f) {
+    extern __shared__ unsigned char paras_dynamic_shared_memory[];
+
+    (void)paras_dynamic_shared_memory;
+
+    gpu_execute_nd_range_1D_body(globalSize, globalRange, localRange, groupRange, f);
+}
+#endif
 
 #if (PARAS_CUDA_BACKEND)
 template <typename Func>
@@ -161,10 +198,22 @@ void rocm_threadpool::gpu_execute_nd_range_1D(const sycl::nd_range<1>& r, Func f
 
     (void)hipGetLastError();
 
-    gpu_execute_nd_range_1D_kernel<<<static_cast<unsigned int>(groups),
-                                     static_cast<unsigned int>(localSize), sharedMemoryBytes,
-                                     stream>>>(globalSize, globalRange, localRange,
-                                               launchedGroupRange, f);
+    using Hint = paras_detail::nd_range_occupancy_hint<Func>;
+    if constexpr (Hint::value) {
+        if (localSize > static_cast<std::size_t>(Hint::max_work_group_size)) {
+            throw sycl::exception(sycl::make_error_code(sycl::errc::nd_range),
+                                  "1D local range exceeds the kernel's "
+                                  "paras_max_work_group_size");
+        }
+        gpu_execute_nd_range_1D_bounded_kernel<Func, Hint::max_work_group_size, Hint::min_waves_per_eu>
+            <<<static_cast<unsigned int>(groups), static_cast<unsigned int>(localSize),
+               sharedMemoryBytes, stream>>>(globalSize, globalRange, localRange, launchedGroupRange, f);
+    } else {
+        gpu_execute_nd_range_1D_kernel<<<static_cast<unsigned int>(groups),
+                                         static_cast<unsigned int>(localSize), sharedMemoryBytes,
+                                         stream>>>(globalSize, globalRange, localRange,
+                                                   launchedGroupRange, f);
+    }
 
     paras_rocm_detail::check(hipGetLastError(), "1D nd_range kernel launch failed");
 
