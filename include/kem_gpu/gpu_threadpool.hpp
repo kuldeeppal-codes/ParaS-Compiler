@@ -49,7 +49,10 @@
 
 #include "gpu_utilities.hpp"
 
+#include <functional>
 #include <memory>
+#include <string>
+#include <vector>
 
 class paras_shared_flag {
 public:
@@ -63,8 +66,14 @@ private:
     std::shared_ptr<bool> value_ = std::make_shared<bool>(false);
 };
 
+struct paras_record_state {
+    std::string error;
+    std::vector<std::shared_ptr<void>> host_tasks;
+};
+
 #if (PARAS_CUDA_BACKEND)
 #include <cuda_runtime.h>
+
 
 class cuda_threadpool {
 
@@ -135,7 +144,7 @@ public:
         : stream(other.stream), ownsStream(other.ownsStream), dev_(other.dev_), ctx_(other.ctx_),
           props_(other.props_), queue_(other.queue_), id_(other.id_),
           stream_alive_(other.stream_alive_), stream_owner_(other.stream_owner_),
-          recording_(other.recording_), record_error_(other.record_error_) {}
+          recording_(other.recording_), record_(other.record_) {}
 
     cuda_threadpool& operator=(const cuda_threadpool& other) {
         if (this == &other) {
@@ -154,7 +163,7 @@ public:
         stream_alive_ = other.stream_alive_;
         stream_owner_ = other.stream_owner_;
         recording_ = other.recording_;
-        record_error_ = other.record_error_;
+        record_ = other.record_;
         return *this;
     }
 
@@ -163,7 +172,7 @@ public:
           ctx_(std::move(other.ctx_)), props_(std::move(other.props_)),
           queue_(std::move(other.queue_)), id_(other.id_),
           stream_alive_(std::move(other.stream_alive_)), stream_owner_(std::move(other.stream_owner_)),
-          recording_(other.recording_), record_error_(other.record_error_) {
+          recording_(other.recording_), record_(other.record_) {
         other.stream = nullptr;
         other.ownsStream = false;
     }
@@ -180,7 +189,7 @@ public:
         stream_alive_ = std::move(other.stream_alive_);
         stream_owner_ = std::move(other.stream_owner_);
         recording_ = other.recording_;
-        record_error_ = other.record_error_;
+        record_ = other.record_;
         dev_ = std::move(other.dev_);
         ctx_ = std::move(other.ctx_);
         props_ = std::move(other.props_);
@@ -230,6 +239,15 @@ public:
     }
 
     bool is_recording() const noexcept { return recording_; }
+
+    void paras_record_host_task(std::function<void()> fn) {
+        auto task = std::make_shared<std::function<void()>>(std::move(fn));
+        const cudaError_t err = cudaLaunchHostFunc(
+            stream, [](void* p) { (*static_cast<std::function<void()>*>(p))(); }, task.get());
+        if (err != cudaSuccess) fail_recording("a host task (cudaLaunchHostFunc failed)");
+        record_->host_tasks.push_back(std::move(task));
+    }
+    [[noreturn]] void paras_fail_recording(const char* what) const { fail_recording(what); }
     void paras_begin_recording();
     std::shared_ptr<void> paras_end_recording();
     std::shared_ptr<void> paras_instantiate_graph(void* graph);
@@ -445,6 +463,59 @@ public:
         return paras_finish_event(paras_t0);
     }
 
+    sycl::event prefetch(const void* ptr, size_t numBytes) {
+        const std::uint64_t paras_t0 = paras_profiling_start();
+        ensure_stream();
+        if (numBytes != 0 && !recording_) {
+#if CUDART_VERSION >= 13000
+            cudaMemLocation loc{};
+            loc.type = cudaMemLocationTypeDevice;
+            loc.id = dev_.get_native_id();
+            const cudaError_t err = cudaMemPrefetchAsync(ptr, numBytes, loc, 0, stream);
+#else
+            const cudaError_t err = cudaMemPrefetchAsync(ptr, numBytes, dev_.get_native_id(), stream);
+#endif
+            if (err != cudaSuccess) (void)cudaGetLastError();
+        }
+        if (!async_launch()) (void)cudaStreamSynchronize(stream);
+        return paras_finish_event(paras_t0);
+    }
+
+    sycl::event mem_advise(const void* ptr, size_t numBytes, int advice) {
+        const std::uint64_t paras_t0 = paras_profiling_start();
+        ensure_stream();
+        if (numBytes != 0 && !recording_) {
+#if CUDART_VERSION >= 13000
+            cudaMemLocation loc{};
+            loc.type = cudaMemLocationTypeDevice;
+            loc.id = dev_.get_native_id();
+            const cudaError_t err = cudaMemAdvise(ptr, numBytes, static_cast<cudaMemoryAdvise>(advice), loc);
+#else
+            const cudaError_t err =
+                cudaMemAdvise(ptr, numBytes, static_cast<cudaMemoryAdvise>(advice), dev_.get_native_id());
+#endif
+            if (err != cudaSuccess) (void)cudaGetLastError();
+        }
+        return paras_finish_event(paras_t0);
+    }
+
+    sycl::event prefetch(const void* ptr, size_t numBytes, sycl::event dep) {
+        dep.wait();
+        return prefetch(ptr, numBytes);
+    }
+    sycl::event prefetch(const void* ptr, size_t numBytes, const std::vector<sycl::event>& deps) {
+        for (auto e : deps) e.wait();
+        return prefetch(ptr, numBytes);
+    }
+    sycl::event mem_advise(const void* ptr, size_t numBytes, int advice, sycl::event dep) {
+        dep.wait();
+        return mem_advise(ptr, numBytes, advice);
+    }
+    sycl::event mem_advise(const void* ptr, size_t numBytes, int advice, const std::vector<sycl::event>& deps) {
+        for (auto e : deps) e.wait();
+        return mem_advise(ptr, numBytes, advice);
+    }
+
     ~cuda_threadpool() noexcept { release_stream_noexcept(); }
 
     bool stream_ordered_copy(void* dest, const void* src) const {
@@ -476,12 +547,12 @@ private:
         return env != nullptr && std::string(env) == "1";
     }();
     paras_shared_flag recording_;
-    std::shared_ptr<std::string> record_error_ = std::make_shared<std::string>();
+    std::shared_ptr<paras_record_state> record_ = std::make_shared<paras_record_state>();
 
     [[noreturn]] void fail_recording(const char* what) const {
-        *record_error_ = std::string(what) + " cannot be recorded into a graph";
+        record_->error = std::string(what) + " cannot be recorded into a graph";
         throw sycl::exception(sycl::make_error_code(sycl::errc::feature_not_supported),
-                              *record_error_);
+                              record_->error);
     }
 
     static bool stream_recording(cudaStream_t s) {
@@ -657,7 +728,7 @@ public:
         : stream(other.stream), ownsStream(other.ownsStream), dev_(other.dev_), ctx_(other.ctx_),
           props_(other.props_), queue_(other.queue_), id_(other.id_),
           stream_alive_(other.stream_alive_), stream_owner_(other.stream_owner_),
-          recording_(other.recording_), record_error_(other.record_error_) {}
+          recording_(other.recording_), record_(other.record_) {}
 
     rocm_threadpool& operator=(const rocm_threadpool& other) {
         if (this == &other) {
@@ -676,7 +747,7 @@ public:
         stream_alive_ = other.stream_alive_;
         stream_owner_ = other.stream_owner_;
         recording_ = other.recording_;
-        record_error_ = other.record_error_;
+        record_ = other.record_;
         return *this;
     }
 
@@ -685,7 +756,7 @@ public:
           ctx_(std::move(other.ctx_)), props_(std::move(other.props_)),
           queue_(std::move(other.queue_)), id_(other.id_),
           stream_alive_(std::move(other.stream_alive_)), stream_owner_(std::move(other.stream_owner_)),
-          recording_(other.recording_), record_error_(other.record_error_) {
+          recording_(other.recording_), record_(other.record_) {
         other.stream = nullptr;
         other.ownsStream = false;
     }
@@ -702,7 +773,7 @@ public:
         stream_alive_ = std::move(other.stream_alive_);
         stream_owner_ = std::move(other.stream_owner_);
         recording_ = other.recording_;
-        record_error_ = other.record_error_;
+        record_ = other.record_;
         dev_ = std::move(other.dev_);
         ctx_ = std::move(other.ctx_);
         props_ = std::move(other.props_);
@@ -752,6 +823,15 @@ public:
     }
 
     bool is_recording() const noexcept { return recording_; }
+
+    void paras_record_host_task(std::function<void()> fn) {
+        auto task = std::make_shared<std::function<void()>>(std::move(fn));
+        const hipError_t err = hipLaunchHostFunc(
+            stream, [](void* p) { (*static_cast<std::function<void()>*>(p))(); }, task.get());
+        if (err != hipSuccess) fail_recording("a host task (hipLaunchHostFunc failed)");
+        record_->host_tasks.push_back(std::move(task));
+    }
+    [[noreturn]] void paras_fail_recording(const char* what) const { fail_recording(what); }
     void paras_begin_recording();
     std::shared_ptr<void> paras_end_recording();
     std::shared_ptr<void> paras_instantiate_graph(void* graph);
@@ -963,6 +1043,42 @@ public:
         return paras_finish_event(paras_t0);
     }
 
+    sycl::event prefetch(const void* ptr, size_t numBytes) {
+        const std::uint64_t paras_t0 = paras_profiling_start();
+        ensure_stream();
+        if (numBytes != 0 && !recording_ &&
+            hipMemPrefetchAsync(ptr, numBytes, dev_.get_native_id(), stream) != hipSuccess)
+            (void)hipGetLastError();
+        if (!async_launch()) (void)hipStreamSynchronize(stream);
+        return paras_finish_event(paras_t0);
+    }
+
+    sycl::event mem_advise(const void* ptr, size_t numBytes, int advice) {
+        const std::uint64_t paras_t0 = paras_profiling_start();
+        ensure_stream();
+        if (numBytes != 0 && !recording_ &&
+            hipMemAdvise(ptr, numBytes, static_cast<hipMemoryAdvise>(advice), dev_.get_native_id()) != hipSuccess)
+            (void)hipGetLastError();
+        return paras_finish_event(paras_t0);
+    }
+
+    sycl::event prefetch(const void* ptr, size_t numBytes, sycl::event dep) {
+        dep.wait();
+        return prefetch(ptr, numBytes);
+    }
+    sycl::event prefetch(const void* ptr, size_t numBytes, const std::vector<sycl::event>& deps) {
+        for (auto e : deps) e.wait();
+        return prefetch(ptr, numBytes);
+    }
+    sycl::event mem_advise(const void* ptr, size_t numBytes, int advice, sycl::event dep) {
+        dep.wait();
+        return mem_advise(ptr, numBytes, advice);
+    }
+    sycl::event mem_advise(const void* ptr, size_t numBytes, int advice, const std::vector<sycl::event>& deps) {
+        for (auto e : deps) e.wait();
+        return mem_advise(ptr, numBytes, advice);
+    }
+
     ~rocm_threadpool() noexcept { release_stream_noexcept(); }
 
     bool stream_ordered_copy(void* dest, const void* src) const {
@@ -999,12 +1115,12 @@ private:
         return env != nullptr && std::string(env) == "1";
     }();
     paras_shared_flag recording_;
-    std::shared_ptr<std::string> record_error_ = std::make_shared<std::string>();
+    std::shared_ptr<paras_record_state> record_ = std::make_shared<paras_record_state>();
 
     [[noreturn]] void fail_recording(const char* what) const {
-        *record_error_ = std::string(what) + " cannot be recorded into a graph";
+        record_->error = std::string(what) + " cannot be recorded into a graph";
         throw sycl::exception(sycl::make_error_code(sycl::errc::feature_not_supported),
-                              *record_error_);
+                              record_->error);
     }
 
     static bool stream_recording(hipStream_t s) {
@@ -1189,6 +1305,61 @@ inline void handler::memcpy(void* dest, const void* src, size_t num_bytes) {
     (void)rocm_pool_->memcpy(dest, src, num_bytes);
 #endif
 }
+
+#if (PARAS_CUDA_BACKEND)
+#define PARAS_HANDLER_POOL gpu_pool_
+#elif (PARAS_HIP_BACKEND)
+#define PARAS_HANDLER_POOL rocm_pool_
+#endif
+
+inline bool handler::paras_recording() const {
+#if (PARAS_CUDA_BACKEND || PARAS_HIP_BACKEND)
+    return PARAS_HANDLER_POOL != nullptr && PARAS_HANDLER_POOL->is_recording();
+#else
+    return false;
+#endif
+}
+
+inline void handler::paras_record_host_task(std::function<void()> fn) {
+#if (PARAS_CUDA_BACKEND || PARAS_HIP_BACKEND)
+    wait_for_dependencies();
+    PARAS_HANDLER_POOL->paras_record_host_task(std::move(fn));
+#else
+    fn();
+#endif
+}
+
+inline void handler::paras_fail_recording(const char* what) const {
+#if (PARAS_CUDA_BACKEND || PARAS_HIP_BACKEND)
+    if (PARAS_HANDLER_POOL != nullptr) PARAS_HANDLER_POOL->paras_fail_recording(what);
+#endif
+    throw sycl::exception(sycl::make_error_code(sycl::errc::feature_not_supported),
+                          std::string(what) + " cannot be recorded into a graph");
+}
+
+inline void handler::paras_prefetch(const void* ptr, std::size_t num_bytes) {
+#if (PARAS_CUDA_BACKEND || PARAS_HIP_BACKEND)
+    if (PARAS_HANDLER_POOL == nullptr || !PARAS_HANDLER_POOL->get_device().is_gpu()) return;
+    wait_for_dependencies();
+    (void)PARAS_HANDLER_POOL->prefetch(ptr, num_bytes);
+#else
+    (void)ptr;
+    (void)num_bytes;
+#endif
+}
+
+inline void handler::paras_mem_advise(const void* ptr, std::size_t num_bytes, int advice) {
+#if (PARAS_CUDA_BACKEND || PARAS_HIP_BACKEND)
+    if (PARAS_HANDLER_POOL == nullptr || !PARAS_HANDLER_POOL->get_device().is_gpu()) return;
+    wait_for_dependencies();
+    (void)PARAS_HANDLER_POOL->mem_advise(ptr, num_bytes, advice);
+#else
+    (void)ptr;
+    (void)num_bytes;
+    (void)advice;
+#endif
+}
+#undef PARAS_HANDLER_POOL
 
 inline void* sycl::interop_handle::get_native_queue() {
     return backend_ptr_;

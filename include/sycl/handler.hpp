@@ -103,6 +103,14 @@ public:
     >*/
     template <typename FunctorT>
     void host_task(FunctorT&& hostFunction) {
+        if (paras_recording()) {
+            if constexpr (std::is_invocable_v<FunctorT&, interop_handle>) {
+                paras_fail_recording("host_task(interop_handle)");
+            } else {
+                paras_record_host_task(std::function<void()>(std::forward<FunctorT>(hostFunction)));
+                return;
+            }
+        }
         wait_for_prior_commands();
         if constexpr (std::is_invocable_v<FunctorT&, interop_handle>) {
             const native_device_scope scope(*this);
@@ -273,6 +281,9 @@ public:
     void wait_for_dependencies() const { sycl::event::wait(deps_); }
 
     void wait_for_prior_commands();
+    bool paras_recording() const;
+    void paras_record_host_task(std::function<void()> fn);
+    [[noreturn]] void paras_fail_recording(const char* what) const;
 
     int paras_activate_native_device();
     static void paras_restore_native_device(int previous) noexcept;
@@ -347,17 +358,23 @@ public:
         memcpy(dest, src, count * sizeof(T));
     }
 
-    /** SYCL-CTS integration (error_log_112): handler::mem_advise()
-     *  and handler::prefetch() -- both performance hints only in
-     *  real SYCL, matching queue's own versions' no-op reasoning.
-     *  The trailing pack accepts and ignores any advice/event
-     *  arguments the call site forwards.
+    /** handler::mem_advise() and handler::prefetch() (SYCL 2020 4.9.4.3):
+     *  performance hints, forwarded to the GPU runtime (see
+     *  paras_prefetch). The trailing pack accepts and ignores any event
+     *  arguments the call site forwards (SYCL-CTS error_log_112).
     >*/
     template <typename... Ignored>
-    void mem_advise(const void*, std::size_t, Ignored&&...) {}
+    void mem_advise(const void* ptr, std::size_t num_bytes, int advice, Ignored&&...) {
+        paras_mem_advise(ptr, num_bytes, advice);
+    }
 
     template <typename... Ignored>
-    void prefetch(const void*, std::size_t, Ignored&&...) {}
+    void prefetch(const void* ptr, std::size_t num_bytes, Ignored&&...) {
+        paras_prefetch(ptr, num_bytes);
+    }
+
+    inline void paras_prefetch(const void* ptr, std::size_t num_bytes);
+    inline void paras_mem_advise(const void* ptr, std::size_t num_bytes, int advice);
 
 private:
     interop_handle host_task_interop_handle() {

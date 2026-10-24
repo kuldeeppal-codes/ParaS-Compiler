@@ -4,8 +4,9 @@
 //
 // Records kernels, a memset, a device-to-device copy and a native call made
 // through a custom operation into a sycl_ext_oneapi_graph command_graph,
-// replays it on changing input data, checks that commands needing the host
-// are refused while recording, and compares the time of 200 small kernels
+// replays it on changing input data, records a host task as a host node
+// (it runs at every replay, after the kernel before it), checks that commands
+// needing the host are refused while recording, and compares the time of 200 small kernels
 // launched one by one with one replay of the same 200 kernels. Prints PASS
 // and returns 0 when every result is correct.
 //
@@ -98,9 +99,33 @@ int main() {
     };
     refused("queue::wait", [&] { q.wait(); });
     refused("copy to host", [&] { q.memcpy(host.data(), out, sizeof(int)); });
-    refused("host_task", [&] { q.submit([&](sycl::handler& h) { h.host_task([] {}); }); });
+    refused("host_task(interop_handle)",
+            [&] { q.submit([&](sycl::handler& h) { h.host_task([](sycl::interop_handle) {}); }); });
     q.memcpy(host.data(), out, sizeof(int));
     q.wait();
+
+    {
+        int* counter = sycl::malloc_shared<int>(1, q);
+        *counter = 0;
+        std::vector<int> seen;
+        sycl_exp::command_graph g{q.get_context(), q.get_device()};
+        g.begin_recording(q);
+        q.single_task([=] { *counter += 1; });
+        q.submit([&](sycl::handler& h) { h.host_task([&seen, counter] { seen.push_back(*counter); }); });
+        q.single_task([=] { *counter += 10; });
+        g.end_recording(q);
+        auto host_exec = g.finalize();
+        for (int r = 0; r < 3; ++r) q.ext_oneapi_graph(host_exec);
+        q.wait();
+        const std::vector<int> want = {1, 12, 23};
+        if (seen != want || *counter != 33) {
+            std::printf("FAIL: host node saw %zu values (", seen.size());
+            for (int v : seen) std::printf(" %d", v);
+            std::printf(" ), counter %d; want 1 12 23, 33\n", *counter);
+            ++failures;
+        }
+        sycl::free(counter, q);
+    }
 
     constexpr int kernels = 200, reps = 20;
     auto chain = [&] {

@@ -260,6 +260,15 @@ inline void handler::memset(void* ptr, int value, size_t num_bytes) {
     std::memset(ptr, value, num_bytes);
 }
 
+inline bool handler::paras_recording() const { return false; }
+inline void handler::paras_record_host_task(std::function<void()> fn) { fn(); }
+inline void handler::paras_fail_recording(const char* what) const {
+    throw sycl::exception(sycl::make_error_code(sycl::errc::feature_not_supported),
+                          std::string(what) + " cannot be recorded into a graph");
+}
+inline void handler::paras_prefetch(const void*, std::size_t) {}
+inline void handler::paras_mem_advise(const void*, std::size_t, int) {}
+
 inline void handler::memcpy(void* dest, const void* src, size_t num_bytes) {
     std::memcpy(dest, src, num_bytes);
 }

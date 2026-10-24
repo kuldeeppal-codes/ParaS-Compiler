@@ -294,24 +294,28 @@ public:
         return memcpy(dest, src, numBytes);
     }
 
-    event mem_advise(const void*, size_t, int) {
-        return submit([&](handler&) {});
+    event mem_advise(const void* ptr, size_t numBytes, int advice) {
+        return submit([&](handler& cgh) { cgh.mem_advise(ptr, numBytes, advice); });
     }
-    event mem_advise(const void*, size_t, int, event) {
-        return submit([&](handler&) {});
+    event mem_advise(const void* ptr, size_t numBytes, int advice, event dep) {
+        paras_wait_dependency(dep);
+        return mem_advise(ptr, numBytes, advice);
     }
-    event mem_advise(const void*, size_t, int, const std::vector<event>&) {
-        return submit([&](handler&) {});
+    event mem_advise(const void* ptr, size_t numBytes, int advice, const std::vector<event>& deps) {
+        paras_wait_dependencies(deps);
+        return mem_advise(ptr, numBytes, advice);
     }
 
-    event prefetch(const void*, size_t) {
-        return submit([&](handler&) {});
+    event prefetch(const void* ptr, size_t numBytes) {
+        return submit([&](handler& cgh) { cgh.prefetch(ptr, numBytes); });
     }
-    event prefetch(const void*, size_t, event) {
-        return submit([&](handler&) {});
+    event prefetch(const void* ptr, size_t numBytes, event dep) {
+        paras_wait_dependency(dep);
+        return prefetch(ptr, numBytes);
     }
-    event prefetch(const void*, size_t, const std::vector<event>&) {
-        return submit([&](handler&) {});
+    event prefetch(const void* ptr, size_t numBytes, const std::vector<event>& deps) {
+        paras_wait_dependencies(deps);
+        return prefetch(ptr, numBytes);
     }
 
 private:
