@@ -22,6 +22,7 @@
 #define __PARAS_DEVICE_HPP__
 
 #include "kem/host_group_runtime.hpp"
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -1045,6 +1046,14 @@ template <>
 inline auto device::get_info<info::device::sub_group_sizes>() const {
     if (is_gpu_) {
 #if (PARAS_HIP_BACKEND)
+        const auto p = version_.find("gfx");
+        if (p != std::string::npos) {
+            std::size_t digits = 0;
+            while (p + 3 + digits < version_.size() &&
+                   std::isxdigit(static_cast<unsigned char>(version_[p + 3 + digits])))
+                ++digits;
+            if (digits >= 4) return std::vector<std::size_t>{32};
+        }
         return std::vector<std::size_t>{64};
 #elif (PARAS_CUDA_BACKEND)
         return std::vector<std::size_t>{32};
