@@ -21,6 +21,7 @@
 #ifndef __PARAS_HANDLER_HPP__
 #define __PARAS_HANDLER_HPP__
 
+#include <memory>
 #include <cstddef>
 #include <functional>
 #include <limits>
@@ -107,7 +108,8 @@ public:
             if constexpr (std::is_invocable_v<FunctorT&, interop_handle>) {
                 paras_fail_recording("host_task(interop_handle)");
             } else {
-                paras_record_host_task(std::function<void()>(std::forward<FunctorT>(hostFunction)));
+                auto held = std::make_shared<std::decay_t<FunctorT>>(std::forward<FunctorT>(hostFunction));
+                paras_record_host_task(std::function<void()>([held] { (*held)(); }));
                 return;
             }
         }

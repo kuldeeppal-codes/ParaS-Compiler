@@ -19,6 +19,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <memory>
 #include <vector>
 
 namespace sycl_exp = sycl::ext::oneapi::experimental;
@@ -122,6 +123,29 @@ int main() {
             std::printf("FAIL: host node saw %zu values (", seen.size());
             for (int v : seen) std::printf(" %d", v);
             std::printf(" ), counter %d; want 1 12 23, 33\n", *counter);
+            ++failures;
+        }
+        sycl::free(counter, q);
+    }
+
+    {
+        int* counter = sycl::malloc_shared<int>(1, q);
+        *counter = 0;
+        auto ran = std::make_shared<int>(0);
+        {
+            sycl_exp::command_graph g{q.get_context(), q.get_device()};
+            g.begin_recording(q);
+            q.single_task([=] { *counter += 1; });
+            q.submit([&](sycl::handler& h) {
+                h.host_task([owned = std::make_unique<int>(7), ran] { *ran += *owned; });
+            });
+            g.end_recording(q);
+            auto exec = g.finalize();
+            q.ext_oneapi_graph(exec);
+        }
+        q.wait();
+        if (*ran != 7 || *counter != 1) {
+            std::printf("FAIL: move-only host node ran %d (want 7), counter %d (want 1)\n", *ran, *counter);
             ++failures;
         }
         sycl::free(counter, q);
