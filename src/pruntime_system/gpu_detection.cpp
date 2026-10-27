@@ -129,8 +129,26 @@ static inline std::vector<std::string> split_csv_4(const std::string& ln) {
     return tok;
 }
 
+static inline bool is_uuid_token(const std::string& token) {
+    return token.rfind("GPU-", 0) == 0 || token.rfind("MIG-", 0) == 0;
+}
+
+static inline long uuid_index(const std::string& token, const std::vector<std::string>& uuids) {
+    const std::string want = to_lower(token);
+    long found = -1;
+    for (std::size_t i = 0; i < uuids.size(); ++i) {
+        if (to_lower(uuids[i]).rfind(want, 0) != 0)
+            continue;
+        if (found >= 0)
+            return -1;
+        found = static_cast<long>(i);
+    }
+    return found;
+}
+
 static inline std::vector<std::size_t>
-get_visible_indices(const char* envName, const std::size_t physicalDeviceCount) {
+get_visible_indices(const char* envName, const std::size_t physicalDeviceCount,
+                    const std::vector<std::string>& uuids = {}) {
     std::vector<std::size_t> indices;
 
     const char* env = std::getenv(envName);
@@ -149,63 +167,107 @@ get_visible_indices(const char* envName, const std::size_t physicalDeviceCount) 
         return indices;
     }
 
-    {
-        std::size_t uuids = 0, others = 0, start = 0;
-        while (start <= visibleDevices.size()) {
-            const std::size_t end = visibleDevices.find(',', start);
-            std::string token = visibleDevices.substr(start, end == std::string::npos ? std::string::npos : end - start);
-            trim_inplace(token);
-            if (!token.empty()) {
-                if (token.rfind("GPU-", 0) == 0 || token.rfind("MIG-", 0) == 0) ++uuids;
-                else ++others;
-            }
-            if (end == std::string::npos) break;
-            start = end + 1;
-        }
-        if (uuids > 0 && others == 0) {
-            for (std::size_t i = 0; i < uuids && i < physicalDeviceCount; ++i) indices.push_back(i);
-            return indices;
-        }
-    }
-
+    std::vector<std::string> tokens;
     std::size_t start = 0;
     while (start <= visibleDevices.size()) {
         const std::size_t end = visibleDevices.find(',', start);
         std::string token = visibleDevices.substr(
             start, end == std::string::npos ? std::string::npos : end - start);
         trim_inplace(token);
-
-        char* parseEnd = nullptr;
-        const long physicalId = std::strtol(token.c_str(), &parseEnd, 10);
-
-        if (parseEnd != token.c_str() && *parseEnd == '\0' && physicalId >= 0 &&
-            static_cast<std::size_t>(physicalId) < physicalDeviceCount) {
-            const std::size_t index = static_cast<std::size_t>(physicalId);
-            if (std::find(indices.begin(), indices.end(), index) == indices.end()) {
-                indices.push_back(index);
-            }
-        }
-
+        if (!token.empty())
+            tokens.push_back(token);
         if (end == std::string::npos) {
             break;
         }
         start = end + 1;
     }
 
+    const bool uuidsKnown = uuids.size() == physicalDeviceCount && physicalDeviceCount > 0;
+    const bool allUuids = !tokens.empty() &&
+                          std::all_of(tokens.begin(), tokens.end(), is_uuid_token);
+    if (allUuids && !uuidsKnown) {
+        for (std::size_t i = 0; i < tokens.size() && i < physicalDeviceCount; ++i)
+            indices.push_back(i);
+        return indices;
+    }
+
+    for (const std::string& token : tokens) {
+        long physicalId = -1;
+        if (is_uuid_token(token)) {
+            if (uuidsKnown)
+                physicalId = uuid_index(token, uuids);
+        } else {
+            char* parseEnd = nullptr;
+            const long id = std::strtol(token.c_str(), &parseEnd, 10);
+            if (parseEnd != token.c_str() && *parseEnd == '\0')
+                physicalId = id;
+        }
+
+        if (physicalId >= 0 && static_cast<std::size_t>(physicalId) < physicalDeviceCount) {
+            const std::size_t index = static_cast<std::size_t>(physicalId);
+            if (std::find(indices.begin(), indices.end(), index) == indices.end()) {
+                indices.push_back(index);
+            }
+        }
+    }
+
     return indices;
+}
+
+static inline std::vector<std::string> nvidia_gpu_uuids() {
+    std::vector<std::string> lines, uuids;
+    if (!run_cmd_lines_cached("nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null", lines))
+        return uuids;
+    for (std::string ln : lines) {
+        trim_inplace(ln);
+        if (!ln.empty())
+            uuids.push_back(ln);
+    }
+    return uuids;
+}
+
+static inline std::vector<std::string> amd_gpu_uuids() {
+    std::vector<std::string> lines, uuids;
+    if (!run_cmd_lines_cached("rocm-smi --showuniqueid 2>/dev/null", lines))
+        return uuids;
+    for (const std::string& ln : lines) {
+        const auto p = ln.find("GPU[");
+        const auto q = ln.find("Unique ID:");
+        if (p == std::string::npos || q == std::string::npos)
+            continue;
+        const std::size_t idx = static_cast<std::size_t>(std::atoi(ln.c_str() + p + 4));
+        std::string id = ln.substr(q + std::string("Unique ID:").size());
+        trim_inplace(id);
+        if (id.rfind("0x", 0) == 0 || id.rfind("0X", 0) == 0)
+            id = id.substr(2);
+        if (id.empty() || id.size() > 16 ||
+            !std::all_of(id.begin(), id.end(), [](unsigned char c) { return std::isxdigit(c) != 0; }))
+            continue;
+        if (uuids.size() <= idx)
+            uuids.resize(idx + 1);
+        uuids[idx] = "GPU-" + std::string(16 - id.size(), '0') + to_lower(id);
+    }
+    if (std::any_of(uuids.begin(), uuids.end(), [](const std::string& u) { return u.empty(); }))
+        uuids.clear();
+    return uuids;
 }
 
 static inline std::vector<std::size_t>
 get_visible_nvidia_indices(const std::size_t physicalDeviceCount) {
-    return get_visible_indices("CUDA_VISIBLE_DEVICES", physicalDeviceCount);
+    return get_visible_indices("CUDA_VISIBLE_DEVICES", physicalDeviceCount, nvidia_gpu_uuids());
 }
 
 static inline std::vector<std::size_t>
 get_visible_amd_indices(const std::size_t physicalDeviceCount) {
-    const auto rocr = get_visible_indices("ROCR_VISIBLE_DEVICES", physicalDeviceCount);
+    const auto uuids = amd_gpu_uuids();
+    const auto rocr = get_visible_indices("ROCR_VISIBLE_DEVICES", physicalDeviceCount, uuids);
     const char* hipEnv = std::getenv("HIP_VISIBLE_DEVICES") ? "HIP_VISIBLE_DEVICES"
                                                             : "CUDA_VISIBLE_DEVICES";
-    const auto hip = get_visible_indices(hipEnv, rocr.size());
+    std::vector<std::string> rocrUuids;
+    if (uuids.size() == physicalDeviceCount)
+        for (const std::size_t i : rocr)
+            rocrUuids.push_back(uuids[i]);
+    const auto hip = get_visible_indices(hipEnv, rocr.size(), rocrUuids);
 
     std::vector<std::size_t> indices;
     indices.reserve(hip.size());
