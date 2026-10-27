@@ -71,9 +71,12 @@ inline std::shared_ptr<void> cuda_threadpool::paras_instantiate_graph(void* grap
         "cudaGraphInstantiateWithFlags");
     const int device = dev_.get_native_id();
     return std::shared_ptr<void>(exec, [device](void* e) {
+        int previous = -1;
+        if (cudaGetDevice(&previous) != cudaSuccess) previous = -1;
         (void)cudaSetDevice(device);
         (void)cudaDeviceSynchronize();
         (void)cudaGraphExecDestroy(static_cast<cudaGraphExec_t>(e));
+        if (previous >= 0 && previous != device) (void)cudaSetDevice(previous);
     });
 }
 
@@ -152,9 +155,12 @@ inline std::shared_ptr<void> rocm_threadpool::paras_instantiate_graph(void* grap
         "hipGraphInstantiate");
     const int device = dev_.get_native_id();
     return std::shared_ptr<void>(exec, [device](void* e) {
+        int previous = -1;
+        if (hipGetDevice(&previous) != hipSuccess) previous = -1;
         (void)hipSetDevice(device);
         (void)hipDeviceSynchronize();
         (void)hipGraphExecDestroy(static_cast<hipGraphExec_t>(e));
+        if (previous >= 0 && previous != device) (void)hipSetDevice(previous);
     });
 }
 

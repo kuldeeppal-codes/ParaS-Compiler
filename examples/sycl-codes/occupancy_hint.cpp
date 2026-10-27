@@ -21,7 +21,7 @@ struct GroupSum {
     int* out;
     sycl::local_accessor<int, 1> lds;
 
-    void operator()(sycl::nd_item<1> it) const {
+    PARAS_KERNEL_HD void operator()(sycl::nd_item<1> it) const {
         const int l = static_cast<int>(it.get_local_id(0));
         const std::size_t g = it.get_group(0);
         lds[l] = in[g * kGroup + l] * (l + 1);

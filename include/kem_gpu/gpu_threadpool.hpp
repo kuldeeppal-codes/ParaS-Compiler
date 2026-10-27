@@ -609,7 +609,9 @@ private:
         std::shared_ptr<bool> alive = stream_alive_;
         stream_owner_ = std::shared_ptr<void>(static_cast<void*>(stream), [device, alive](void* p) {
             cudaStream_t s = static_cast<cudaStream_t>(p);
+            int previous = -1;
             if (device >= 0) {
+                if (cudaGetDevice(&previous) != cudaSuccess) previous = -1;
                 const cudaError_t setErr = cudaSetDevice(device);
                 if (setErr != cudaSuccess)
                     std::cerr << "cudaSetDevice before cudaStreamDestroy failed: " << cudaGetErrorString(setErr) << '\n';
@@ -620,6 +622,7 @@ private:
             *alive = false;
             const cudaError_t err = cudaStreamDestroy(s);
             if (err != cudaSuccess) std::cerr << "cudaStreamDestroy failed: " << cudaGetErrorString(err) << '\n';
+            if (previous >= 0 && previous != device) (void)cudaSetDevice(previous);
         });
     }
 
@@ -1177,7 +1180,9 @@ private:
         std::shared_ptr<bool> alive = stream_alive_;
         stream_owner_ = std::shared_ptr<void>(static_cast<void*>(stream), [device, alive](void* p) {
             hipStream_t s = static_cast<hipStream_t>(p);
+            int previous = -1;
             if (device >= 0) {
+                if (hipGetDevice(&previous) != hipSuccess) previous = -1;
                 const hipError_t setErr = hipSetDevice(device);
                 if (setErr != hipSuccess)
                     std::cerr << "hipSetDevice before hipStreamDestroy failed: " << hipGetErrorString(setErr) << '\n';
@@ -1188,6 +1193,7 @@ private:
             *alive = false;
             const hipError_t err = hipStreamDestroy(s);
             if (err != hipSuccess) std::cerr << "hipStreamDestroy failed: " << hipGetErrorString(err) << '\n';
+            if (previous >= 0 && previous != device) (void)hipSetDevice(previous);
         });
     }
 

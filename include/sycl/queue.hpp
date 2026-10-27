@@ -22,6 +22,7 @@
 #define __PARAS_QUEUE_HPP__
 
 #include <iostream>
+#include <atomic>
 #include <exception>
 #include <stdexcept>
 #include <mutex>
@@ -47,25 +48,32 @@ namespace sycl {
 template <typename Pool>
 class shared_pool_slot {
 public:
-    explicit operator bool() const { return static_cast<bool>(slot_->pool); }
-    bool operator==(std::nullptr_t) const { return !slot_->pool; }
-    bool operator!=(std::nullptr_t) const { return static_cast<bool>(slot_->pool); }
-    Pool* operator->() const { return slot_->pool.get(); }
-    Pool& operator*() const { return *slot_->pool; }
+    explicit operator bool() const { return get() != nullptr; }
+    bool operator==(std::nullptr_t) const { return get() == nullptr; }
+    bool operator!=(std::nullptr_t) const { return get() != nullptr; }
+    Pool* operator->() const { return get(); }
+    Pool& operator*() const { return *get(); }
 
     template <typename Make>
     Pool& get_or_create(Make make) const {
+        if (Pool* p = get()) return *p;
         std::lock_guard<std::mutex> lock(slot_->mutex);
-        if (!slot_->pool) slot_->pool = make();
-        return *slot_->pool;
+        if (!slot_->owner) {
+            slot_->owner = make();
+            slot_->pool.store(slot_->owner.get(), std::memory_order_release);
+        }
+        return *slot_->owner;
     }
 
     void detach() { slot_ = std::make_shared<Shared>(); }
 
 private:
+    Pool* get() const { return slot_->pool.load(std::memory_order_acquire); }
+
     struct Shared {
         std::mutex mutex;
-        std::shared_ptr<Pool> pool;
+        std::shared_ptr<Pool> owner;
+        std::atomic<Pool*> pool{nullptr};
     };
     std::shared_ptr<Shared> slot_ = std::make_shared<Shared>();
 };

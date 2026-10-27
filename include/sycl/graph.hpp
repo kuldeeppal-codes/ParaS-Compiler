@@ -150,6 +150,15 @@ public:
 private:
     struct impl {
         explicit impl(const sycl::device& d) : device(d) {}
+        impl(const impl&) = delete;
+        impl& operator=(const impl&) = delete;
+        ~impl() {
+            if (!recording || !end) return;
+            try {
+                (void)end();
+            } catch (...) {
+            }
+        }
         sycl::device device;
         const void* queue_identity = nullptr;
         std::function<std::shared_ptr<void>()> end;
